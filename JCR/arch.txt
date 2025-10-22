@@ -1,0 +1,9 @@
+rssi_reconstruct_semi_mod/
+├─ cli_train.py # 主程式（參數、資料載入、呼叫訓練、最終測試/MDE 列印）
+├─ dataio.py # 檔案讀寫、欄位工具、隨機種子
+├─ scaling.py # fit_scaler / apply_scaler
+├─ datasets.py # RSSISourceDataset / RSSITargetDataset / TestDataset
+├─ models.py # MLP / FullModel
+├─ losses.py # masked_mse
+├─ eval_utils.py # evaluate_classification / load_rp_map
+├─ train_loop.py # 與原程式一致的訓練迴圈 + 記錄/儲圖
