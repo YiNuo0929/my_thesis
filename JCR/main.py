@@ -7,7 +7,7 @@ import torch
 from dataio import load_csvs, get_feature_cols, set_seed
 from scaling import fit_scaler, apply_scaler
 from datasets import RSSISourceDataset, RSSITargetDataset, TestDataset
-from models import FullModel
+from models import FullModel, trans_FullModel
 from eval_utils import evaluate_classification, load_rp_map
 from train_loop import train_model
 
@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--ignore_missing_in_recon", action="store_true")
     parser.add_argument("--out_dir", type=str, default="./rssi_recon_ckpt")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--encoder", type=str, default='transformer')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -88,10 +89,16 @@ def main():
 
     # -------- Model --------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = FullModel(len(ap_cols), n_classes).to(device)
+    if args.encoder == 'transformer':
+        model = trans_FullModel(len(ap_cols), n_classes).to(device)
+        print("啟用transformer-based encoder")
+    else:
+        model = FullModel(len(ap_cols), n_classes).to(device)
+        print("啟用dnn-based encoder")
     ce = torch.nn.CrossEntropyLoss()
 
     # -------- Train --------
+    print("開始train!!!!")
     best_acc, id_maps = train_model(
         model, dl_src, dl_tgt, dl_te, device, ce, args.lambda_recon,
         args.ignore_missing_in_recon, args.out_dir, args.epochs
