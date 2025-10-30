@@ -4,7 +4,7 @@ from losses import masked_mse
 from eval_utils import evaluate_classification
 
 def train_model(model, dl_src, dl_tgt, dl_te, device, ce, lambda_recon, ignore_missing_in_recon, out_dir, epochs):
-    it_tgt, best_acc = cycle(dl_tgt), -1.0
+    it_tgt, best_acc = cycle(dl_tgt), -1.0  #target domain 的 dataloader 轉成無限循環迭代器。因為 target 資料通常少每輪需要重複利用。
     hist = dict(epoch=[], train_ce=[], rec_s=[], rec_t=[], val_ce=[], val_acc=[])
     opt = torch.optim.AdamW(model.parameters())
 

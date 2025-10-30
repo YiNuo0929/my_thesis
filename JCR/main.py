@@ -23,11 +23,13 @@ def main():
     parser.add_argument("--batch_size_tgt", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    '''
     parser.add_argument("--feat_dim", type=int, default=256)
     parser.add_argument("--ext_hidden", type=int, nargs="+", default=[512, 512])
     parser.add_argument("--cls_hidden", type=int, nargs="+", default=[256])
     parser.add_argument("--rec_hidden", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--dropout", type=float, default=0.4)
+    '''
     parser.add_argument("--lambda_recon", type=float, default=1.0)
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--ignore_missing_in_recon", action="store_true")
@@ -86,8 +88,7 @@ def main():
 
     # -------- Model --------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = FullModel(len(ap_cols), n_classes, args.feat_dim, args.ext_hidden,
-                      args.cls_hidden, args.rec_hidden, args.dropout).to(device)
+    model = FullModel(len(ap_cols), n_classes).to(device)
     ce = torch.nn.CrossEntropyLoss()
 
     # -------- Train --------

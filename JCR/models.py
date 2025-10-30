@@ -14,8 +14,8 @@ class MLP(nn.Module):
     def forward(self, x): return self.net(x)
 
 class FullModel(nn.Module):
-    def __init__(self, in_dim, n_classes, feat_dim=256, ext_hidden=[512,512],
-                 cls_hidden=[256], rec_hidden=[256,256], dropout=0.4):
+    def __init__(self, in_dim, n_classes, feat_dim=720, ext_hidden=[512,512],
+                 cls_hidden=[256], rec_hidden=[128], dropout=0.4):
         super().__init__()
         self.extractor = MLP(in_dim, ext_hidden + [feat_dim], None, dropout)
         self.cls_head = MLP(feat_dim, cls_hidden, n_classes, dropout)

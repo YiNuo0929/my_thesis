@@ -5,7 +5,9 @@ class RSSISourceDataset(Dataset):
     def __init__(self, df, ap_cols, label_col="rp_id", missing_val=0.0):
         # 已在外部 apply_scaler
         self.X = df[ap_cols].values.astype(np.float32)
-        self.miss = (df[ap_cols].values == missing_val).astype(np.float32)
+        self.miss = (df[ap_cols].values == missing_val).astype(np.float32)  
+        #我現在是把0設為缺值，這邊以後可能要改一下
+        #因為標準化最小值也是0
 
         # Label 轉成 index
         y_raw = df[label_col].values.astype(np.int64)
@@ -19,9 +21,9 @@ class RSSISourceDataset(Dataset):
 
     def __getitem__(self, i):
         return (
-            torch.from_numpy(self.X[i]),
-            torch.tensor(self.y[i]),
-            torch.from_numpy(self.miss[i]),
+            torch.from_numpy(self.X[i]),   #標準化之後rssi fingerprint的向量
+            torch.tensor(self.y[i]),    #對應到的的rp標籤
+            torch.from_numpy(self.miss[i]),     #缺值遮罩(1代表缺值)
         )
 
 
