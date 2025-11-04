@@ -27,15 +27,15 @@ class TransformerExtractor(nn.Module):
     def __init__(
         self,
         num_tokens: int,             # N_AP (= in_dim)
-        feat_dim: int = 512,         # 對齊你 FullModel 預設 720
-        d_model: int = 128,          #一開始先增加維度
-        nhead: int = 8,
-        num_layers: int = 4,
-        dim_feedforward: int = 256,
-        dropout: float = 0.1,
-        use_cls_token: bool = True,  # 用 [CLS] 匯聚；關掉用 mean pooling
-        use_mask: bool = False,      # 是否啟用缺失值 masking（預設關閉）
-        mask_value: float = 0.0      # 缺失值（你的 Dataset 預設 0.0）
+        feat_dim: int,         # 對齊你 FullModel 預設 720
+        d_model: int,          #一開始先增加維度
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        use_cls_token: bool,  # 用 [CLS] 匯聚；關掉用 mean pooling
+        use_mask: bool,      # 是否啟用缺失值 masking（預設關閉）
+        mask_value: float      # 缺失值（你的 Dataset 預設 0.0）
     ):
         super().__init__()
         self.num_tokens = num_tokens
@@ -152,7 +152,7 @@ class trans_FullModel(nn.Module):
     """
     def __init__(self, in_dim, n_classes, feat_dim = 512, cls_hidden = [256], rec_hidden = [128], dropout: float = 0.4,
                  # Transformer 超參
-                 d_model= 128, nhead = 8, num_layers = 4, dim_feedforward = 256, attn_dropout: float = 0.1,
+                 d_model= 128, nhead = 8, num_layers = 1, dim_feedforward = 256, attn_dropout: float = 0.1,
                  use_cls_token: bool = True,   # True: 取 CLS；False: mean pooling
                  use_mask: bool = False,       # True: 對 (x == mask_value) 做 key_padding_mask
                  mask_value: float = 0.0):
