@@ -217,13 +217,13 @@ class TransClassifier(nn.Module):
         self,
         num_ap: int,
         n_classes: int,
-        d_model: int = 64,
-        nhead: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 128,
-        dropout: float = 0.1,
-        mlp_hidden=[256, 128],
-        p_drop: float = 0.2,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        mlp_hidden,
+        p_drop: float,
     ):
         super().__init__()
         # extractor：學 AP 間關係
@@ -281,9 +281,9 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.2)
 
     # 新增 Transformer 的超參數
-    parser.add_argument("--d_model", type=int, default=64)
-    parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--nhead", type=int, default=8)
+    parser.add_argument("--num_layers", type=int, default=1)
     parser.add_argument("--dim_feedforward", type=int, default=128)
     args = parser.parse_args()
 

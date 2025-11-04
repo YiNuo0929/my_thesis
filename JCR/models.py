@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
+import math
 
 class MLP(nn.Module):
     def __init__(self, in_dim, hidden, out_dim=None, dropout=0.4, last_activation=False):
@@ -15,35 +16,46 @@ class MLP(nn.Module):
         self.net = nn.Sequential(*layers)
     def forward(self, x): return self.net(x)
 
+class FullModel(nn.Module):
+    def __init__(self, in_dim, n_classes, feat_dim=256, ext_hidden=[512,512],
+                 cls_hidden=[256], rec_hidden=[128], dropout=0.4):
+        super().__init__()
+        self.extractor = MLP(in_dim, ext_hidden + [feat_dim], None, dropout)
+        self.cls_head = MLP(feat_dim, cls_hidden, n_classes, dropout)
+        self.rec_head = MLP(feat_dim, rec_hidden, in_dim, dropout)
+    def forward(self, x):
+        f = self.extractor(x)
+        return self.cls_head(f), self.rec_head(f), f
+
 class TransformerExtractor(nn.Module):
     """
     一維 RSSI Fingerprint 的 Transformer-Encoder 特徵擷取器（無輸入正規化）。
     - 輸入:  x ∈ R^{B, N_AP}，每個 AP 值 = 一個 token
     - 遮罩:  use_mask=True 時，(x == mask_value) 會當成 key_padding_mask
-    - 結構:  token Linear(1->d_model) -> (可選) [CLS] + learned pos emb
+    - 結構:  token Linear(1->d_model) -> (可選) [CLS] + **固定 sinusoidal pos emb**
            -> TransformerEncoder -> 池化 -> 線性投影到 feat_dim
     - 輸出:  feat ∈ R^{B, feat_dim}
     """
     def __init__(
         self,
-        num_tokens: int,             # N_AP (= in_dim)
-        feat_dim: int,         # 對齊你 FullModel 預設 720
-        d_model: int,          #一開始先增加維度
+        num_tokens: int,       # N_AP (= in_dim)
+        feat_dim: int,         # 對齊你 FullModel 預設 720 或 512 等
+        d_model: int,          # Transformer hidden dim
         nhead: int,
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
-        use_cls_token: bool,  # 用 [CLS] 匯聚；關掉用 mean pooling
-        use_mask: bool,      # 是否啟用缺失值 masking（預設關閉）
-        mask_value: float      # 缺失值（你的 Dataset 預設 0.0）
+        use_cls_token: bool,   # 用 [CLS] 匯聚；關掉用 mean pooling
+        use_mask: bool,        # 是否啟用缺失值 masking（預設關閉）
+        mask_value: float      # 缺失值（你的 Dataset 預設 0.0 或其他）
     ):
         super().__init__()
-        self.num_tokens = num_tokens
-        self.feat_dim = feat_dim
-        self.d_model = d_model
+        self.num_tokens   = num_tokens
+        self.feat_dim     = feat_dim
+        self.d_model      = d_model
         self.use_cls_token = use_cls_token
-        self.use_mask = use_mask
-        self.mask_value = mask_value
+        self.use_mask     = use_mask
+        self.mask_value   = mask_value
 
         # 每 token（單一 RSSI scalar）嵌入到 d_model
         self.token_embed = nn.Linear(1, d_model)
@@ -51,9 +63,16 @@ class TransformerExtractor(nn.Module):
         # (可選) [CLS] token
         self.cls_embed = nn.Parameter(torch.zeros(1, 1, d_model)) if use_cls_token else None
 
-        # learned positional embedding（含 CLS）
-        n_pos = num_tokens + (1 if use_cls_token else 0)
-        self.pos_embed = nn.Parameter(torch.randn(1, n_pos, d_model) * 0.02)
+        # ===== 固定 sinusoidal 位置編碼（含 CLS 位置）=====
+        n_pos = num_tokens + (1 if use_cls_token else 0)   # token 數 + CLS（若有）
+        pe = torch.zeros(n_pos, d_model)                   # [n_pos, d_model]
+        position = torch.arange(0, n_pos, dtype=torch.float32).unsqueeze(1)  # [n_pos, 1]
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)                               # [1, n_pos, d_model]
+        # 存成 buffer，不參與訓練
+        self.register_buffer("pos_embed", pe)
 
         # Transformer Encoder
         enc_layer = nn.TransformerEncoderLayer(
@@ -68,15 +87,6 @@ class TransformerExtractor(nn.Module):
 
         self.out_norm = nn.LayerNorm(d_model)
         self.proj = nn.Linear(d_model, feat_dim)
-
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        if self.cls_embed is not None:
-            nn.init.trunc_normal_(self.cls_embed, std=0.02)
-        nn.init.xavier_uniform_(self.token_embed.weight); nn.init.zeros_(self.token_embed.bias)
-        nn.init.xavier_uniform_(self.proj.weight);        nn.init.zeros_(self.proj.bias)
 
     @staticmethod
     def _masked_mean(x: Tensor, key_padding_mask: Tensor) -> Tensor:
@@ -100,16 +110,17 @@ class TransformerExtractor(nn.Module):
         key_padding_mask = (x == self.mask_value) if self.use_mask else None
 
         # (B,N) -> (B,N,1) -> (B,N,d_model)
-        tok = self.token_embed(x.unsqueeze(-1))
+        tok = self.token_embed(x.unsqueeze(-1))   # (B,N,D)
 
-        # 加 [CLS] 與位置嵌入
+        # 加 [CLS] 與位置嵌入（sinusoidal, fixed）
         if self.use_cls_token:
             cls = self.cls_embed.expand(B, 1, self.d_model)   # (B,1,D)
             tok = torch.cat([cls, tok], dim=1)                # (B,N+1,D)
-            pos = self.pos_embed[:, : tok.size(1), :]
+            pos = self.pos_embed[:, : tok.size(1), :]         # (1,N+1,D)
         else:
-            pos = self.pos_embed[:, : tok.size(1), :]
-        tok = tok + pos
+            pos = self.pos_embed[:, : tok.size(1), :]         # (1,N,D)
+
+        tok = tok + pos                                       # (B,T,D)
 
         # 準備 key padding mask（若含 CLS，最前面補 False）
         src_key_padding_mask = None
@@ -118,7 +129,7 @@ class TransformerExtractor(nn.Module):
                 pad = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
                 src_key_padding_mask = torch.cat([pad, key_padding_mask], dim=1)  # (B,N+1)
             else:
-                src_key_padding_mask = key_padding_mask
+                src_key_padding_mask = key_padding_mask       # (B,N)
 
         # Encoder
         enc = self.encoder(tok, src_key_padding_mask=src_key_padding_mask)  # (B,T,D)
@@ -132,16 +143,6 @@ class TransformerExtractor(nn.Module):
         feat = self.proj(self.out_norm(pooled))  # (B, feat_dim)
         return feat
 
-class FullModel(nn.Module):
-    def __init__(self, in_dim, n_classes, feat_dim=512, ext_hidden=[512,512],
-                 cls_hidden=[256], rec_hidden=[128], dropout=0.4):
-        super().__init__()
-        self.extractor = MLP(in_dim, ext_hidden + [feat_dim], None, dropout)
-        self.cls_head = MLP(feat_dim, cls_hidden, n_classes, dropout)
-        self.rec_head = MLP(feat_dim, rec_hidden, in_dim, dropout)
-    def forward(self, x):
-        f = self.extractor(x)
-        return self.cls_head(f), self.rec_head(f), f
 
 class trans_FullModel(nn.Module):
     """
@@ -150,9 +151,9 @@ class trans_FullModel(nn.Module):
     - extractor: TransformerExtractor（支援 use_mask, [CLS]/mean 匯聚）
     - head: 與原本一致，皆吃 feat_dim
     """
-    def __init__(self, in_dim, n_classes, feat_dim = 512, cls_hidden = [256], rec_hidden = [128], dropout: float = 0.4,
+    def __init__(self, in_dim, n_classes, feat_dim = 256, cls_hidden = [256], rec_hidden = [128], dropout: float = 0.4,
                  # Transformer 超參
-                 d_model= 128, nhead = 8, num_layers = 1, dim_feedforward = 256, attn_dropout: float = 0.1,
+                 d_model= 128, nhead = 8, num_layers = 2, dim_feedforward = 256, attn_dropout: float = 0.4,
                  use_cls_token: bool = True,   # True: 取 CLS；False: mean pooling
                  use_mask: bool = False,       # True: 對 (x == mask_value) 做 key_padding_mask
                  mask_value: float = 0.0):
