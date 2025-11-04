@@ -92,7 +92,7 @@ class MLPBlock(nn.Module):
         return self.seq(x)
 
 
-# -------- 新增：Positional Encoding --------
+# -------- Positional Encoding --------
 class PositionalEncoding(nn.Module):
     """
     標準 sin/cos 位置編碼，batch_first = True 對應 [B, L, d_model]
@@ -115,15 +115,16 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :L, :]
         return x
 
-# -------- 新增：Transformer-based Extractor --------
+# -------- Transformer-based Extractor + 壓縮 MLP --------
 class TransformerExtractor(nn.Module):
     """
     把每個 AP 當成一個 token：
     - input:  [B, 1, L]  (L 個 AP)
     - 先轉成 [B, L, 1] 再線性投影到 d_model 維度
-    - 加上位置編碼
+    - 加上位置編碼 + (可選) CLS
     - 通過 TransformerEncoder
-    - 使用 CLS token 或 mean pooling 取得整體 fingerprint 向量
+    - 取 CLS → 經 bottleneck MLP 壓成 z_dim
+    - output: z ∈ [B, z_dim]
     """
     def __init__(
         self,
@@ -133,11 +134,14 @@ class TransformerExtractor(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
-        use_cls_token: bool
+        use_cls_token: bool,
+        z_dim: int,               # 🔴 壓縮後的 latent 維度
+        bottleneck_hidden: int = None,  # 中間 hidden 維度（如果 None 就用 d_model）
     ):
         super().__init__()
         self.use_cls_token = use_cls_token
         self.d_model = d_model
+        self.z_dim = z_dim
 
         # 每個 RSSI scalar -> d_model 維
         self.input_proj = nn.Linear(1, d_model)
@@ -161,10 +165,21 @@ class TransformerExtractor(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # ---- bottleneck MLP: CLS(d_model) → hidden → z_dim ----
+        if bottleneck_hidden is None:
+            bottleneck_hidden = d_model  # 預設 hidden = d_model，不另外壓縮這一層
+
+        self.bottleneck = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, bottleneck_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(bottleneck_hidden, z_dim)
+        )
+
     def forward(self, x: torch.Tensor):
         """
         x: [B, 1, L] 或 [B, L]
-        return: [B, d_model]  (整個 fingerprint 的向量)
+        return: z ∈ [B, z_dim]  (整個 fingerprint 的壓縮向量)
         """
         if x.dim() == 3:
             # [B, 1, L] -> [B, L]
@@ -184,20 +199,23 @@ class TransformerExtractor(nn.Module):
         h = self.pos_encoding(h)
         h = self.encoder(h)                          # [B, seq_len, d_model]
 
+        # 取 CLS 或 mean pooling
         if self.use_cls_token:
-            # 回傳 CLS 位置的向量
-            return h[:, 0, :]                        # [B, d_model]
+            cls_feat = h[:, 0, :]                    # [B, d_model]
         else:
-            # 或者用 mean pooling
-            return h.mean(dim=1)                     # [B, d_model]
+            cls_feat = h.mean(dim=1)                 # [B, d_model]
 
-# -------- 新增：Predictor (MLP head) --------
+        # 經 bottleneck MLP 壓縮成 z
+        z = self.bottleneck(cls_feat)                # [B, z_dim]
+        return z
+
+# -------- Predictor (MLP head) --------
 class PredictorMLP(nn.Module):
     """
-    接 transformer 抽出來的全局特徵 [B, d_model]，
+    接 transformer 抽出來的全局特徵 z [B, z_dim]，
     再接幾層 MLP + 最後分類器。
     """
-    def __init__(self, in_dim: int, n_classes: int, hidden=[256, 128], p_drop=0.2):
+    def __init__(self, in_dim: int, n_classes: int, hidden=[256, 256], p_drop=0.2):
         super().__init__()
         dims = [in_dim] + hidden
         blocks = []
@@ -211,7 +229,7 @@ class PredictorMLP(nn.Module):
         logits = self.head(x)
         return logits
 
-# -------- 新增：整體模型 = TransformerExtractor + PredictorMLP --------
+# -------- 整體模型 = TransformerExtractor(產生 z) + PredictorMLP --------
 class TransClassifier(nn.Module):
     def __init__(
         self,
@@ -222,11 +240,12 @@ class TransClassifier(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
+        z_dim: int,           # 🔴 壓縮後 latent 維度
         mlp_hidden,
         p_drop: float,
     ):
         super().__init__()
-        # extractor：學 AP 間關係
+        # extractor：學 AP 間關係並壓成 z
         self.extractor = TransformerExtractor(
             num_tokens=num_ap,
             d_model=d_model,
@@ -235,10 +254,12 @@ class TransClassifier(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             use_cls_token=True,
+            z_dim=z_dim,
+            bottleneck_hidden=None  # 預設 hidden = d_model，你之後想改可以改這裡
         )
-        # predictor：接上 MLP head 做分類
+        # predictor：接上 MLP head 做分類（吃 z_dim）
         self.predictor = PredictorMLP(
-            in_dim=d_model,
+            in_dim=z_dim,
             n_classes=n_classes,
             hidden=mlp_hidden,
             p_drop=p_drop,
@@ -246,8 +267,8 @@ class TransClassifier(nn.Module):
 
     def forward(self, x):
         # x: [B, 1, L]
-        feat = self.extractor(x)     # [B, d_model]
-        logits = self.predictor(feat)
+        z = self.extractor(x)     # [B, z_dim]
+        logits = self.predictor(z)
         return logits
 
 # ---------- Metrics / Maps ----------
@@ -270,24 +291,26 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_path", type=str, required=True)
     parser.add_argument("--test_path",  type=str, required=True)
-    parser.add_argument("--rp_map_path", type=str, default=r"C:\Users\Yinuo\Desktop\my_thesis\rp_id.csv")
+    parser.add_argument("--rp_map_path", type=str, default=r"C:\\Users\\Yinuo\\Desktop\\my_thesis\\rp_id.csv")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./rssi_dnn_baseline_ckpt")
-    # 原本 DNN 用的 hidden & dropout，現在當作 predictor MLP 的設定
-    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 128])
+    # predictor MLP 的設定
+    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--dropout", type=float, default=0.2)
 
-    # 新增 Transformer 的超參數
+    # Transformer 的超參數
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=1)
     parser.add_argument("--dim_feedforward", type=int, default=128)
-    args = parser.parse_args()
 
-    # os.makedirs(args.out_dir, exist_ok=True)
+    # 🔴 新增：壓縮後 latent 維度 z_dim
+    parser.add_argument("--z_dim", type=int, default=32)
+
+    args = parser.parse_args()
 
     # --- Load data ---
     df_tr = load_csvs(args.train_path)
@@ -302,7 +325,6 @@ def main():
 
     # --- Fit scaler on train ---
     means, stds = fit_scaler(df_tr[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
-    # np.savez(os.path.join(args.out_dir, "scaler_ap_means_stds.npz"), means=means, stds=stds)
 
     # --- Build train dataset/loader ---
     ds_tr = RSSIDataset(df_tr, ap_cols, means=means, stds=stds, missing_val=args.missing_val)
@@ -332,7 +354,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_ap = len(ap_cols)
 
-    # 使用 Transformer-based 模型
+    # 使用 Transformer-based 模型（含壓縮 bottleneck）
     model = TransClassifier(
         num_ap=num_ap,
         n_classes=len(id2idx),
@@ -341,6 +363,7 @@ def main():
         num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward,
         dropout=args.dropout,
+        z_dim=args.z_dim,          # 🔴 壓縮後的 latent 維度
         mlp_hidden=args.hidden,
         p_drop=args.dropout,
     ).to(device)

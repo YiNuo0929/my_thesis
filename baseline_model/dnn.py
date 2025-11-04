@@ -105,7 +105,7 @@ class DNNClassifier(nn.Module):
     常見於 RSSI fingerprint 的 DNN：多層全連接（含 BN+ReLU+Dropout），
     以全域特徵（所有 AP 向量）直接分類 RP。
     """
-    def __init__(self, in_len: int, n_classes: int, hidden=[512, 256, 128], p_drop=0.2):
+    def __init__(self, in_len: int, n_classes: int, hidden=[512, 256, 256], p_drop=0.2):
         super().__init__()
         dims = [in_len] + hidden
         blocks = []

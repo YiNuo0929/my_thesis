@@ -12,6 +12,61 @@ from eval_utils import evaluate_classification, load_rp_map
 from train_loop import train_model
 
 
+# -------- 共用的測試函式（沿用你原本的 evaluation 流程）---------
+def eval_on_test(model, dl_te, device, id_maps, y_te_raw, y_te_idx, rp_map, tag=""):
+    from math import sqrt
+
+    model.eval()
+    preds_idx = []
+    with torch.no_grad():
+        for xb, yb_idx, _ in dl_te:
+            xb = xb.to(device)
+            logits, _, _ = model(xb)
+            preds_idx.append(logits.argmax(1).cpu().numpy())
+    preds_idx = np.concatenate(preds_idx) if preds_idx else np.array([])
+
+    # 與原版一致：用訓練時的 idx2id 對應回 rpid，並用 te 的 y_te_raw/y_te_idx 當作 GT
+    idx2id = id_maps["idx2id"]
+    preds_rpid = np.array([idx2id.get(int(i), -999999) for i in preds_idx], dtype=int)
+    gts_rpid   = y_te_raw
+    eval_mask  = (y_te_idx != -1)
+
+    acc = (preds_idx[eval_mask] == y_te_idx[eval_mask]).mean().item() if eval_mask.any() else float("nan")
+
+    mde_distances, floor_mismatch, mde_skipped_notfound = [], 0, 0
+    for gt_id, pr_id, use in zip(gts_rpid, preds_rpid, eval_mask):
+        if not use:
+            continue
+        gt_info = rp_map.get(int(gt_id), None)
+        pr_info = rp_map.get(int(pr_id), None)
+        if (gt_info is None) or (pr_info is None):
+            mde_skipped_notfound += 1
+            continue
+        gx, gy, gf = gt_info
+        px, py, pf = pr_info
+        if gf != pf:
+            floor_mismatch += 1
+        else:
+            d = sqrt((gx - px)**2 + (gy - py)**2)
+            mde_distances.append(d)
+
+    avg_mde = (float(np.mean(mde_distances)) if len(mde_distances) > 0 else float("nan"))
+
+    # === 與原始輸出格式幾乎一致，多加一個 Tag 標示是哪個模型 ===
+    print(f"==== Final Test Metrics ({tag}) ====" if tag else "==== Final Test Metrics ====")
+    print(f"Test samples total          : {len(y_te_idx)}")
+    print(f"Evaluated (label available) : {int(eval_mask.sum())}")
+    print(f"Test Accuracy               : {acc:.4f}" if not np.isnan(acc) else "Test Accuracy               : N/A")
+    print(
+        f"Mean Distance Error (same floor only): {avg_mde:.4f} (meters)"
+        if not np.isnan(avg_mde) else
+        "Mean Distance Error (same floor only): N/A"
+    )
+    print(f"Floor mismatches (excluded from MDE) : {floor_mismatch}")
+    print(f"Skipped (rp_id not in rp_map)        : {mde_skipped_notfound}")
+    print()  # 空行好看一點
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source_train_path", type=str, required=True)
@@ -104,59 +159,56 @@ def main():
         args.ignore_missing_in_recon, args.out_dir, args.epochs
     )
 
-    # -------- Evaluate (MDE) --------
-    from math import sqrt
-
-    model.eval()
-    preds_idx = []
-    with torch.no_grad():
-        for xb, yb_idx, _ in dl_te:
-            xb = xb.to(device)
-            logits, _, _ = model(xb)
-            preds_idx.append(logits.argmax(1).cpu().numpy())
-    preds_idx = np.concatenate(preds_idx) if preds_idx else np.array([])
-
-    # 與原版一致：用訓練時的 idx2id 對應回 rpid，並用 te 的 y_te_raw/y_te_idx 當作 GT
-    idx2id = id_maps["idx2id"]
-    preds_rpid = np.array([idx2id.get(int(i), -999999) for i in preds_idx], dtype=int)
-    gts_rpid   = y_te_raw
-    eval_mask  = (y_te_idx != -1)
-
-    acc = (preds_idx[eval_mask] == y_te_idx[eval_mask]).mean().item() if eval_mask.any() else float("nan")
-
+    # -------- 準備 rp_map（只讀一次即可） --------
     rp_map = load_rp_map(args.rp_map_path)
-    mde_distances, floor_mismatch, mde_skipped_notfound = [], 0, 0
-    for gt_id, pr_id, use in zip(gts_rpid, preds_rpid, eval_mask):
-        if not use: 
-            continue
-        gt_info = rp_map.get(int(gt_id), None)
-        pr_info = rp_map.get(int(pr_id), None)
-        if (gt_info is None) or (pr_info is None):
-            mde_skipped_notfound += 1
-            continue
-        gx, gy, gf = gt_info
-        px, py, pf = pr_info
-        if gf != pf:
-            floor_mismatch += 1
-        else:
-            d = sqrt((gx - px)**2 + (gy - py)**2)
-            mde_distances.append(d)
 
-    avg_mde = (float(np.mean(mde_distances)) if len(mde_distances) > 0 else float("nan"))
-
-    # === 與原始輸出格式完全一致 ===
-    print("==== Final Test Metrics ====")
-    print(f"Test samples total          : {len(y_te_idx)}")
-    print(f"Evaluated (label available) : {int(eval_mask.sum())}")
-    print(f"Test Accuracy               : {acc:.4f}" if not np.isnan(acc) else "Test Accuracy               : N/A")
-    print(
-        f"Mean Distance Error (same floor only): {avg_mde:.4f} (meters)"
-        if not np.isnan(avg_mde) else
-        "Mean Distance Error (same floor only): N/A"
+    # -------- Evaluate 1：原本做法（最後一個 epoch 的 model）--------
+    eval_on_test(
+        model=model,
+        dl_te=dl_te,
+        device=device,
+        id_maps=id_maps,
+        y_te_raw=y_te_raw,
+        y_te_idx=y_te_idx,
+        rp_map=rp_map,
+        tag="last_epoch_model"
     )
-    print(f"Floor mismatches (excluded from MDE) : {floor_mismatch}")
-    print(f"Skipped (rp_id not in rp_map)        : {mde_skipped_notfound}")
 
+    # -------- Evaluate 2：val 表現最佳的 checkpoint --------
+    best_val_ckpt = os.path.join(args.out_dir, "best_recon_model.pth")
+    if os.path.exists(best_val_ckpt):
+        ckpt = torch.load(best_val_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        eval_on_test(
+            model=model,
+            dl_te=dl_te,
+            device=device,
+            id_maps=id_maps,
+            y_te_raw=y_te_raw,
+            y_te_idx=y_te_idx,
+            rp_map=rp_map,
+            tag="best_val_acc"
+        )
+    else:
+        print(f"[WARN] best_recon_model.pth not found under {args.out_dir}")
+
+    # -------- Evaluate 3：train loss 最低的 checkpoint --------
+    best_train_ckpt = os.path.join(args.out_dir, "best_train_loss_model.pth")
+    if os.path.exists(best_train_ckpt):
+        ckpt = torch.load(best_train_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        eval_on_test(
+            model=model,
+            dl_te=dl_te,
+            device=device,
+            id_maps=id_maps,
+            y_te_raw=y_te_raw,
+            y_te_idx=y_te_idx,
+            rp_map=rp_map,
+            tag="best_train_loss"
+        )
+    else:
+        print(f"[WARN] best_train_loss_model.pth not found under {args.out_dir}")
 
 
 if __name__ == "__main__":
