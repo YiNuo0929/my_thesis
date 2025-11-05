@@ -28,39 +28,63 @@ def get_feature_cols(df: pd.DataFrame):
     return ap_cols
 
 def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
-    mask = train_ap != missing_val
-    means = np.zeros(train_ap.shape[1], dtype=np.float32)
-    stds  = np.ones(train_ap.shape[1], dtype=np.float32)
-    for j in range(train_ap.shape[1]):
-        col = train_ap[:, j]; m = mask[:, j]
-        if m.any():
-            mu = col[m].mean(); sigma = col[m].std()
-            if sigma < 1e-6: sigma = 1.0
-        else:
-            mu, sigma = -100.0, 10.0
-        means[j] = mu; stds[j] = sigma
-    return means, stds
+    """
+    改成 Min-Max scaler：
+    - 只用非 missing_val 的值算 per-AP min / max
+    - 之後會把資料壓到 [0,1]
+    """
+    mask_valid = (train_ap != missing_val)
+    n_feats = train_ap.shape[1]
+    mins = np.zeros(n_feats, dtype=np.float32)
+    maxs = np.ones(n_feats, dtype=np.float32)
 
-def apply_scaler(x: np.ndarray, means: np.ndarray, stds: np.ndarray, missing_val: float = -110.0):
-    x = x.copy()
+    for j in range(n_feats):
+        col = train_ap[:, j]
+        m = mask_valid[:, j]
+        if m.any():
+            v = col[m]
+            vmin = v.min()
+            vmax = v.max()
+            if abs(vmax - vmin) < 1e-6:
+                # 避免分母為 0
+                vmax = vmin + 1.0
+        else:
+            # 該 AP 完全沒有有效值，給個 dummy 範圍
+            vmin, vmax = 0.0, 1.0
+        mins[j] = vmin
+        maxs[j] = vmax
+    return mins, maxs
+
+def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val: float = -110.0):
+    """
+    Min-Max 正規化到 [0,1]，缺失值補 0：
+    - 對非 missing 的位置做 (x - min) / (max - min)，clip 到 [0,1]
+    - 原本是 missing_val 的位置，最後強制設為 0
+    """
+    x = x.copy().astype(np.float32)
     miss_mask = (x == missing_val)
-    # 用每個 AP 的平均值補缺失
-    x[miss_mask] = np.take(means, np.where(miss_mask)[1])
-    # per-AP z-score
-    x = (x - means) / stds
+
+    # Min-Max scaling
+    denom = (maxs - mins)
+    denom[denom == 0.0] = 1.0  # safety
+    x = (x - mins) / denom
+    x = np.clip(x, 0.0, 1.0)
+
+    # 缺失的地方直接設成 0
+    x[miss_mask] = 0.0
     return x
 
 class RSSIDataset(Dataset):
     def __init__(self, df: pd.DataFrame, ap_cols, label_col="rp_id",
-                 means=None, stds=None, missing_val=-110.0):
+                 mins=None, maxs=None, missing_val=-110.0):
         self.ap_cols = ap_cols
         self.y_raw = df[label_col].values.astype(np.int64)  # 保留原始 rp_id（做 MDE 用）
         self.X = df[ap_cols].values.astype(np.float32)
         self.missing_val = missing_val
-        self.means = means
-        self.stds  = stds
-        if (means is not None) and (stds is not None):
-            self.X = apply_scaler(self.X, self.means, self.stds, self.missing_val)
+        self.mins = mins
+        self.maxs = maxs
+        if (mins is not None) and (maxs is not None):
+            self.X = apply_scaler(self.X, self.mins, self.maxs, self.missing_val)
         # 與 CNN 版對齊：維度 [N, 1, L]；之後在 model 內再 squeeze
         self.X = np.expand_dims(self.X, axis=1)
 
@@ -91,7 +115,6 @@ class MLPBlock(nn.Module):
     def forward(self, x):
         return self.seq(x)
 
-
 # -------- Positional Encoding --------
 class PositionalEncoding(nn.Module):
     """
@@ -115,13 +138,15 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :L, :]
         return x
 
-# -------- Transformer-based Extractor + 壓縮 MLP --------
+# -------- Transformer-based Extractor + 壓縮 MLP + key_padding_mask --------
 class TransformerExtractor(nn.Module):
     """
     把每個 AP 當成一個 token：
     - input:  [B, 1, L]  (L 個 AP)
+    - 資料已經是 [0,1] 的 normalized 值，missing 的位置 = 0
     - 先轉成 [B, L, 1] 再線性投影到 d_model 維度
     - 加上位置編碼 + (可選) CLS
+    - 可選：use_mask=True 時，對 x==mask_value 做 key_padding_mask
     - 通過 TransformerEncoder
     - 取 CLS → 經 bottleneck MLP 壓成 z_dim
     - output: z ∈ [B, z_dim]
@@ -135,13 +160,17 @@ class TransformerExtractor(nn.Module):
         dim_feedforward: int,
         dropout: float,
         use_cls_token: bool,
-        z_dim: int,               # 🔴 壓縮後的 latent 維度
+        z_dim: int,               # 壓縮後 latent 維度
         bottleneck_hidden: int = None,  # 中間 hidden 維度（如果 None 就用 d_model）
+        use_mask: bool = False,
+        mask_value: float = 0.0,        # 哪個值當作 padding/missing
     ):
         super().__init__()
         self.use_cls_token = use_cls_token
         self.d_model = d_model
         self.z_dim = z_dim
+        self.use_mask = use_mask
+        self.mask_value = mask_value
 
         # 每個 RSSI scalar -> d_model 維
         self.input_proj = nn.Linear(1, d_model)
@@ -167,7 +196,7 @@ class TransformerExtractor(nn.Module):
 
         # ---- bottleneck MLP: CLS(d_model) → hidden → z_dim ----
         if bottleneck_hidden is None:
-            bottleneck_hidden = d_model  # 預設 hidden = d_model，不另外壓縮這一層
+            bottleneck_hidden = d_model  # 預設 hidden = d_model
 
         self.bottleneck = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -178,26 +207,43 @@ class TransformerExtractor(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """
-        x: [B, 1, L] 或 [B, L]
+        x: [B, 1, L] 或 [B, L]（已經是 [0,1] normalized）
         return: z ∈ [B, z_dim]  (整個 fingerprint 的壓縮向量)
         """
         if x.dim() == 3:
             # [B, 1, L] -> [B, L]
             x = x.squeeze(1)
-        # [B, L] -> [B, L, 1]
+
+        B, L = x.shape
+
+        # 根據值==mask_value 來決定要不要忽略（當 padding/missing）
+        key_padding_mask = None
+        if self.use_mask:
+            key_padding_mask = (x == self.mask_value)   # True 代表「忽略」
+
+        # [B, L] -> [B, L, 1] -> [B, L, d_model]
         x = x.unsqueeze(-1)
-        # [B, L, 1] -> [B, L, d_model]
         h = self.input_proj(x)
 
         # 加 CLS token
         if self.use_cls_token:
-            B = h.size(0)
-            cls = self.cls_token.expand(B, -1, -1)   # [B, 1, d_model]
-            h = torch.cat([cls, h], dim=1)           # [B, 1+L, d_model]
+            cls = self.cls_token.expand(B, 1, self.d_model)   # [B, 1, d_model]
+            h = torch.cat([cls, h], dim=1)                    # [B, 1+L, d_model]
 
-        # 位置編碼 + encoder
-        h = self.pos_encoding(h)
-        h = self.encoder(h)                          # [B, seq_len, d_model]
+        # 位置編碼
+        h = self.pos_encoding(h)                              # [B, T, d_model]
+
+        # 準備給 encoder 的 key_padding_mask
+        src_key_padding_mask = None
+        if key_padding_mask is not None:
+            if self.use_cls_token:
+                pad = torch.zeros(B, 1, dtype=torch.bool, device=h.device)
+                src_key_padding_mask = torch.cat([pad, key_padding_mask], dim=1)  # [B, 1+L]
+            else:
+                src_key_padding_mask = key_padding_mask                             # [B, L]
+
+        # Encoder
+        h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)  # [B, T, d_model]
 
         # 取 CLS 或 mean pooling
         if self.use_cls_token:
@@ -240,9 +286,11 @@ class TransClassifier(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
-        z_dim: int,           # 🔴 壓縮後 latent 維度
+        z_dim: int,           # 壓縮後 latent 維度
         mlp_hidden,
         p_drop: float,
+        use_mask: bool,
+        mask_value: float = 0.0,
     ):
         super().__init__()
         # extractor：學 AP 間關係並壓成 z
@@ -255,7 +303,9 @@ class TransClassifier(nn.Module):
             dropout=dropout,
             use_cls_token=True,
             z_dim=z_dim,
-            bottleneck_hidden=None  # 預設 hidden = d_model，你之後想改可以改這裡
+            bottleneck_hidden=None,  # 預設 hidden = d_model
+            use_mask=use_mask,
+            mask_value=mask_value
         )
         # predictor：接上 MLP head 做分類（吃 z_dim）
         self.predictor = PredictorMLP(
@@ -280,7 +330,7 @@ def load_rp_map(rp_map_path: str):
     df = pd.read_csv(rp_map_path, encoding="utf-8-sig")
     need = {"rp_id","x","y","floor"}
     if not need.issubset(df.columns):
-        raise ValueError(f"rp_id.csv 缺少欄位（需要 {need}）")
+        raise ValueError("rp_id.csv 缺少欄位（需要 {need}）")
     mp = {}
     for _, r in df.iterrows():
         mp[int(r["rp_id"])] = (float(r["x"]), float(r["y"]), int(r["floor"]))
@@ -291,7 +341,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_path", type=str, required=True)
     parser.add_argument("--test_path",  type=str, required=True)
-    parser.add_argument("--rp_map_path", type=str, default=r"C:\\Users\\Yinuo\\Desktop\\my_thesis\\rp_id.csv")
+    parser.add_argument("--rp_map_path", type=str, default=r"rp_id.csv")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -307,8 +357,12 @@ def main():
     parser.add_argument("--num_layers", type=int, default=1)
     parser.add_argument("--dim_feedforward", type=int, default=128)
 
-    # 🔴 新增：壓縮後 latent 維度 z_dim
+    # 壓縮後 latent 維度 z_dim
     parser.add_argument("--z_dim", type=int, default=32)
+
+    # 是否啟用 key_padding_mask
+    parser.add_argument("--use_mask", type=bool, default="True",
+                        help="啟用 key_padding_mask，將值==0 的 AP 當作 padding/missing 忽略掉")
 
     args = parser.parse_args()
 
@@ -323,18 +377,18 @@ def main():
     if n_classes_tr != 48:
         print(f"[WARN] 訓練集 rp 類別數={n_classes_tr}（預期 48）")
 
-    # --- Fit scaler on train ---
-    means, stds = fit_scaler(df_tr[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
+    # --- Fit scaler on train (Min-Max) ---
+    mins, maxs = fit_scaler(df_tr[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
 
     # --- Build train dataset/loader ---
-    ds_tr = RSSIDataset(df_tr, ap_cols, means=means, stds=stds, missing_val=args.missing_val)
+    ds_tr = RSSIDataset(df_tr, ap_cols, mins=mins, maxs=maxs, missing_val=args.missing_val)
     id2idx = ds_tr.id2idx
     idx2id = ds_tr.idx2id
     dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
     # --- Prepare test arrays (只在最後 eval 用) ---
-    X_te_full = df_te[ap_cols].values.astype(np.float32)
-    X_te_full = apply_scaler(X_te_full, means, stds, args.missing_val)
+    X_te_full_raw = df_te[ap_cols].values.astype(np.float32)
+    X_te_full = apply_scaler(X_te_full_raw, mins, maxs, args.missing_val)
     X_te_full = np.expand_dims(X_te_full, axis=1)
 
     # y 映射（未知類別或 -1 → -1）
@@ -354,7 +408,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_ap = len(ap_cols)
 
-    # 使用 Transformer-based 模型（含壓縮 bottleneck）
+    # 使用 Transformer-based 模型（含壓縮 bottleneck + 可選 mask）
     model = TransClassifier(
         num_ap=num_ap,
         n_classes=len(id2idx),
@@ -363,14 +417,17 @@ def main():
         num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward,
         dropout=args.dropout,
-        z_dim=args.z_dim,          # 🔴 壓縮後的 latent 維度
+        z_dim=args.z_dim,
         mlp_hidden=args.hidden,
         p_drop=args.dropout,
+        use_mask=args.use_mask,
+        mask_value=0.0,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
 
+    print(f"use mask or not: {model.extractor.use_mask}")
     # --- Train ---
     for epoch in range(1, args.epochs+1):
         model.train()
@@ -421,7 +478,7 @@ def main():
 
     # --- MDE 計算 ---
     rp_map = load_rp_map(args.rp_map_path)
-    preds_rpid = np.array([idx2id[int(i)] if int(i) in idx2id else -999999 for i in preds_idx], dtype=int)
+    preds_rpid = np.array([idx2id.get(int(i), -999999) for i in preds_idx], dtype=int)
 
     mde_distances = []
     floor_mismatch = 0
