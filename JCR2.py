@@ -389,17 +389,17 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./result")
-    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 512])
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
+    parser.add_argument("--dropout", type=float, default=0.5)
 
     # Transformer 超參
-    parser.add_argument("--d_model", type=int, default=64)
-    parser.add_argument("--nhead", type=int, default=8)
+    parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--nhead", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dim_feedforward", type=int, default=128)
     parser.add_argument("--recon_hidden",type=int, nargs="+", default=[128])
 
-    parser.add_argument("--z_dim", type=int, default=32)
+    parser.add_argument("--z_dim", type=int, default=16)
 
     parser.add_argument("--use_mask", type=bool, default=True,
                         help="啟用 key_padding_mask，將值==0 的 AP 當作 padding/missing 忽略掉")
@@ -420,8 +420,7 @@ def main():
     assert set(ap_cols).issubset(df_tgt.columns), "Target 缺少部分 AP 欄位"
 
     n_classes_tr = df_src["rp_id"].nunique()
-    if n_classes_tr != 48:
-        print(f"[WARN] 訓練集 rp 類別數={n_classes_tr}（預期 48）")
+    print(f"[WARN] 訓練集 rp 類別數={n_classes_tr}")
 
     # --- Fit scaler on source train (Min-Max) ---
     mins, maxs = fit_scaler(df_src[ap_cols].values.astype(np.float32), missing_val=args.missing_val)

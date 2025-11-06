@@ -1,11 +1,16 @@
-# rssi_dann.py  (target 批次補齊 + domain acc 版)
+# rssi_dann_minmax.py  (target 批次補齊 + domain acc 版)
 # Usage:
-#   python rssi_dann.py ^
+#   python rssi_dann_minmax.py ^
 #     --source_train_path "C:\Users\Yinuo\Desktop\UJI_LIB_DB_v2.2\db\01\train_all\all_trn_merged.csv" ^
 #     --target_train_path "C:\Users\Yinuo\Desktop\UJI_LIB_DB_v2.2\db\04\train_all\all_trn_merged.csv" ^
 #     --test_path         "C:\Users\Yinuo\Desktop\UJI_LIB_DB_v2.2\db\04\test_all\all_tst_merged.csv" ^
 #     --rp_map_path       "C:\Users\Yinuo\Desktop\my_thesis\rp_id.csv" ^
 #     --epochs 50 --batch_size_src 256 --batch_size_tgt 256 --lr 1e-3
+#
+# 說明（前處理部分已改為 min–max）：
+# - Scaler：source domain 每 AP min–max 正規化
+# - 缺值 (-110) 以該 AP 的最小值補
+# - DANN 架構：feature extractor + classifier + domain discriminator
 
 import argparse, os, math, random
 import numpy as np
@@ -37,27 +42,45 @@ def get_feature_cols(df: pd.DataFrame):
         raise ValueError("No AP columns (prefix 'ap') found.")
     return ap_cols
 
+# -------------------- Min–Max Scaler --------------------
 def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
+    """
+    為每個 AP 計算 min / max，用於 Min–Max Normalization。
+    忽略 missing_val。
+    """
     mask = train_ap != missing_val
-    means = np.zeros(train_ap.shape[1], dtype=np.float32)
-    stds  = np.ones(train_ap.shape[1], dtype=np.float32)
-    for j in range(train_ap.shape[1]):
-        col = train_ap[:, j]; m = mask[:, j]
-        if m.any():
-            mu = col[m].mean(); sigma = col[m].std()
-            if sigma < 1e-6: sigma = 1.0
-        else:
-            mu, sigma = -100.0, 10.0
-        means[j] = mu; stds[j] = sigma
-    return means, stds
+    mins = np.zeros(train_ap.shape[1], dtype=np.float32)
+    maxs = np.zeros(train_ap.shape[1], dtype=np.float32)
 
-def apply_scaler(x: np.ndarray, means: np.ndarray, stds: np.ndarray, missing_val: float = -110.0):
+    for j in range(train_ap.shape[1]):
+        col = train_ap[:, j]
+        m = mask[:, j]
+        if m.any():
+            valid = col[m]
+            mn = valid.min()
+            mx = valid.max()
+            if abs(mx - mn) < 1e-6:
+                # 避免除以 0
+                mx = mn + 1.0
+        else:
+            # 若整個 AP 都是缺值，給一個預設範圍
+            mn, mx = -100.0, -30.0
+        mins[j] = mn
+        maxs[j] = mx
+    return mins, maxs
+
+def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val: float = -110.0):
+    """
+    對輸入 x 做 per-AP Min–Max Normalization：
+      1. 缺值補成該 AP 的 min
+      2. (x - min) / (max - min)
+    """
     x = x.copy()
     miss_mask = (x == missing_val)
     if miss_mask.any():
         ap_idx = np.where(miss_mask)[1]
-        x[miss_mask] = means[ap_idx]
-    x = (x - means) / stds
+        x[miss_mask] = mins[ap_idx]
+    x = (x - mins) / (maxs - mins)
     return x
 
 def set_seed(seed: int = 42):
@@ -69,16 +92,16 @@ def set_seed(seed: int = 42):
 # -------------------- Datasets --------------------
 class RSSISourceDataset(Dataset):
     def __init__(self, df: pd.DataFrame, ap_cols, label_col="rp_id",
-                 means=None, stds=None, missing_val=-110.0):
+                 mins=None, maxs=None, missing_val=-110.0):
         self.ap_cols = ap_cols
         self.X = df[ap_cols].values.astype(np.float32)
         self.y_raw = df[label_col].values.astype(np.int64)
 
         self.missing_val = missing_val
-        self.means = means
-        self.stds  = stds
-        if (means is not None) and (stds is not None):
-            self.X = apply_scaler(self.X, self.means, self.stds, self.missing_val)
+        self.mins = mins
+        self.maxs = maxs
+        if (mins is not None) and (maxs is not None):
+            self.X = apply_scaler(self.X, self.mins, self.maxs, self.missing_val)
 
         self.X = np.expand_dims(self.X, axis=1)  # [N,1,L]
 
@@ -92,9 +115,9 @@ class RSSISourceDataset(Dataset):
         return torch.from_numpy(self.X[i]), torch.tensor(self.y[i], dtype=torch.long)
 
 class RSSITargetDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, ap_cols, means, stds, missing_val=-110.0):
+    def __init__(self, df: pd.DataFrame, ap_cols, mins, maxs, missing_val=-110.0):
         X = df[ap_cols].values.astype(np.float32)
-        X = apply_scaler(X, means, stds, missing_val)
+        X = apply_scaler(X, mins, maxs, missing_val)
         self.X = np.expand_dims(X, axis=1)  # [N,1,L]
 
     def __len__(self): return len(self.X)
@@ -114,7 +137,7 @@ class MLPBlock(nn.Module):
     def forward(self, x): return self.seq(x)
 
 class FeatureExtractor(nn.Module):
-    def __init__(self, in_len: int, hidden=[512, 256, 128], p_drop=0.2):
+    def __init__(self, in_len: int, hidden=[512, 256], p_drop=0.2):
         super().__init__()
         dims = [in_len] + hidden
         blocks = [MLPBlock(a, b, p_drop=p_drop) for a, b in zip(dims[:-1], dims[1:])]
@@ -196,19 +219,19 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
 
-    parser.add_argument("--hidden", type=int, nargs="+", default=[512, 256, 128])
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--hidden", type=int, nargs="+", default=[512, 256, 256])
+    parser.add_argument("--dropout", type=float, default=0.4)
     parser.add_argument("--disc_hidden", type=int, default=128)
 
     parser.add_argument("--missing_val", type=float, default=-110.0)
-    parser.add_argument("--out_dir", type=str, default="./rssi_dann_ckpt")
+    parser.add_argument("--out_dir", type=str, default="./rssi_dann_minmax_ckpt")
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--grl_gamma", type=float, default=10.0)
     parser.add_argument("--domain_loss_w", type=float, default=0.7)
 
     args = parser.parse_args()
-    #os.makedirs(args.out_dir, exist_ok=True)
+    # os.makedirs(args.out_dir, exist_ok=True)
     set_seed(args.seed)
 
     # --------- Load DataFrames ---------
@@ -220,23 +243,25 @@ def main():
     assert set(ap_cols).issubset(df_tgt.columns), "Target 訓練資料缺少部分 AP 欄位"
     assert set(ap_cols).issubset(df_te.columns),  "Test 資料缺少部分 AP 欄位"
 
-    # --------- Scaler (fit on source only) ---------
-    means, stds = fit_scaler(df_src[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
-    #np.savez(os.path.join(args.out_dir, "scaler_ap_means_stds.npz"), means=means, stds=stds)
+    # --------- Scaler (fit on source only, min-max) ---------
+    mins, maxs = fit_scaler(df_src[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
+    # np.savez(os.path.join(args.out_dir, "scaler_ap_mins_maxs.npz"), mins=mins, maxs=maxs)
 
     # --------- Datasets / Loaders ---------
-    ds_src = RSSISourceDataset(df_src, ap_cols, means=means, stds=stds, missing_val=args.missing_val)
+    ds_src = RSSISourceDataset(df_src, ap_cols, mins=mins, maxs=maxs, missing_val=args.missing_val)
     id2idx, idx2id = ds_src.id2idx, ds_src.idx2id
     n_classes = len(id2idx)
 
-    dl_src = DataLoader(ds_src, batch_size=args.batch_size_src, shuffle=True, drop_last=True, num_workers=0, pin_memory=True)
+    dl_src = DataLoader(ds_src, batch_size=args.batch_size_src, shuffle=True,
+                        drop_last=True, num_workers=0, pin_memory=True)
 
-    ds_tgt = RSSITargetDataset(df_tgt, ap_cols, means=means, stds=stds, missing_val=args.missing_val)
-    dl_tgt = DataLoader(ds_tgt, batch_size=args.batch_size_tgt, shuffle=True, drop_last=True, num_workers=0, pin_memory=True)
+    ds_tgt = RSSITargetDataset(df_tgt, ap_cols, mins=mins, maxs=maxs, missing_val=args.missing_val)
+    dl_tgt = DataLoader(ds_tgt, batch_size=args.batch_size_tgt, shuffle=True,
+                        drop_last=True, num_workers=0, pin_memory=True)
 
     # --------- Test set (one-shot eval) ---------
     X_te = df_te[ap_cols].values.astype(np.float32)
-    X_te = apply_scaler(X_te, means, stds, args.missing_val)
+    X_te = apply_scaler(X_te, mins, maxs, args.missing_val)
     X_te = np.expand_dims(X_te, axis=1)
 
     y_te_raw = df_te["rp_id"].astype(int).values if "rp_id" in df_te.columns else np.full(len(df_te), -1, dtype=int)
@@ -286,7 +311,6 @@ def main():
 
             xt, _ = next(it_tgt)                   # 無限循環
 
-            # ---- 明確回存到同名變數，避免 IDE 警告 ----
             xs = xs.to(device, non_blocking=True)
             ys = ys.to(device, non_blocking=True)
             xt = xt.to(device, non_blocking=True)
@@ -317,18 +341,18 @@ def main():
                 dom_acc_s = (dom_logits_s.argmax(1) == dom_label_s).float().mean().item()
                 dom_acc_t = (dom_logits_t.argmax(1) == dom_label_t).float().mean().item()
 
-            running_cls += cls_loss.item()
-            running_dom += dom_loss.item()
-            running_src_acc += src_acc
+            running_cls       += cls_loss.item()
+            running_dom       += dom_loss.item()
+            running_src_acc   += src_acc
             running_dom_acc_s += dom_acc_s
             running_dom_acc_t += dom_acc_t
 
-        avg_src_cls = running_cls / steps_per_epoch
-        avg_dom = running_dom / steps_per_epoch
-        avg_src_acc = running_src_acc / steps_per_epoch
+        avg_src_cls   = running_cls / steps_per_epoch
+        avg_dom       = running_dom / steps_per_epoch
+        avg_src_acc   = running_src_acc / steps_per_epoch
         avg_dom_acc_s = running_dom_acc_s / steps_per_epoch
         avg_dom_acc_t = running_dom_acc_t / steps_per_epoch
-        avg_dom_acc = 0.5 * (avg_dom_acc_s + avg_dom_acc_t)
+        avg_dom_acc   = 0.5 * (avg_dom_acc_s + avg_dom_acc_t)
 
         print(f"Epoch {epoch:03d} | src_cls_loss {avg_src_cls:.4f} "
               f"| dom_loss {avg_dom:.4f} "
@@ -360,7 +384,8 @@ def main():
 
     mde_distances, floor_mismatch, mde_skipped_notfound = [], 0, 0
     for gt_id, pr_id, use in zip(gts_rpid, preds_rpid, eval_mask):
-        if not use: continue
+        if not use:
+            continue
         gt_info = rp_map.get(int(gt_id), None)
         pr_info = rp_map.get(int(pr_id), None)
         if (gt_info is None) or (pr_info is None):

@@ -1,15 +1,16 @@
-# rssi_dnn_baseline.py
+# rssi_dnn_baseline_minmax.py
 # Usage:
-#   python rssi_dnn_baseline.py ^
+#   python rssi_dnn_baseline_minmax.py ^
 #     --train_path "C:\Users\Yinuo\Desktop\UJI_LIB_DB_v2.2\db\01\train_all\all_trn_merged.csv" ^
 #     --test_path  "C:\Users\Yinuo\Desktop\UJI_LIB_DB_v2.2\db\01\test_all\all_tst_merged.csv" ^
 #     --rp_map_path "C:\Users\Yinuo\Desktop\my_thesis\rp_id.csv" ^
 #     --epochs 50 --batch_size 256 --lr 1e-3
 #
 # 說明：
-# - 與 CNN 版相同：讀檔/每AP標準化/缺值(-110)以該AP均值補/分類訓練/最終一次性測試
-# - 評估輸出包含：Test Accuracy、同樓層 MDE、樓層不一致計數、rp_map 缺失略過數
-# - 模型：多層全連接 MLP，搭配 BatchNorm + ReLU + Dropout（常見於 RSSI fingerprint 文獻）
+# - 每 AP 正規化 (Min–Max Normalization)
+# - 缺值 (-110) 以該 AP 最小值補
+# - 模型：多層全連接 MLP + BatchNorm + ReLU + Dropout
+# - 評估輸出：Test Accuracy、MDE、樓層不一致數等
 
 import argparse, os
 import numpy as np
@@ -33,59 +34,86 @@ def load_csvs(path_like: str) -> pd.DataFrame:
         df = pd.read_csv(p, encoding="utf-8-sig")
     return df
 
+
 def get_feature_cols(df: pd.DataFrame):
     ap_cols = [c for c in df.columns if c.startswith("ap")]
     if not ap_cols:
         raise ValueError("No AP columns (prefix 'ap') found.")
     return ap_cols
 
-def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
-    mask = train_ap != missing_val
-    means = np.zeros(train_ap.shape[1], dtype=np.float32)
-    stds  = np.ones(train_ap.shape[1], dtype=np.float32)
-    for j in range(train_ap.shape[1]):
-        col = train_ap[:, j]; m = mask[:, j]
-        if m.any():
-            mu = col[m].mean(); sigma = col[m].std()
-            if sigma < 1e-6: sigma = 1.0
-        else:
-            mu, sigma = -100.0, 10.0
-        means[j] = mu; stds[j] = sigma
-    return means, stds
 
-def apply_scaler(x: np.ndarray, means: np.ndarray, stds: np.ndarray, missing_val: float = -110.0):
+# ---------- Min–Max Normalization ----------
+def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
+    """
+    為每個 AP 計算 min / max，用於 Min–Max Normalization。
+    忽略 missing_val 的樣本。
+    """
+    mask = train_ap != missing_val
+    mins = np.zeros(train_ap.shape[1], dtype=np.float32)
+    maxs = np.zeros(train_ap.shape[1], dtype=np.float32)
+
+    for j in range(train_ap.shape[1]):
+        col = train_ap[:, j]
+        m = mask[:, j]
+        if m.any():
+            valid = col[m]
+            mn = valid.min()
+            mx = valid.max()
+            if abs(mx - mn) < 1e-6:
+                # 避免除以 0 的情況
+                mx = mn + 1.0
+        else:
+            mn, mx = -100.0, -30.0  # 預設範圍
+        mins[j] = mn
+        maxs[j] = mx
+    return mins, maxs
+
+
+def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val: float = -110.0):
+    """
+    對輸入 x 做 per-AP Min–Max Normalization：
+      (x - min) / (max - min)
+    缺值以該 AP 的最小值補。
+    """
     x = x.copy()
     miss_mask = (x == missing_val)
-    # 用每個 AP 的平均值補缺失
-    x[miss_mask] = np.take(means, np.where(miss_mask)[1])
-    # per-AP z-score
-    x = (x - means) / stds
+
+    # 用各 AP 的最小值補缺失
+    if miss_mask.any():
+        x[miss_mask] = np.take(mins, np.where(miss_mask)[1])
+
+    # per-AP min-max normalization
+    x = (x - mins) / (maxs - mins)
     return x
 
+
+# ---------- Dataset ----------
 class RSSIDataset(Dataset):
     def __init__(self, df: pd.DataFrame, ap_cols, label_col="rp_id",
-                 means=None, stds=None, missing_val=-110.0):
+                 mins=None, maxs=None, missing_val=-110.0):
         self.ap_cols = ap_cols
-        self.y_raw = df[label_col].values.astype(np.int64)  # 保留原始 rp_id（做 MDE 用）
+        self.y_raw = df[label_col].values.astype(np.int64)
         self.X = df[ap_cols].values.astype(np.float32)
         self.missing_val = missing_val
-        self.means = means
-        self.stds  = stds
-        if (means is not None) and (stds is not None):
-            self.X = apply_scaler(self.X, self.means, self.stds, self.missing_val)
-        # 與 CNN 版對齊：維度 [N, 1, L]；DNN 會在 forward 內 squeeze 回 [N, L]
+        self.mins = mins
+        self.maxs = maxs
+
+        if (mins is not None) and (maxs is not None):
+            self.X = apply_scaler(self.X, self.mins, self.maxs, self.missing_val)
+
+        # 對齊 CNN：維度 [N, 1, L]
         self.X = np.expand_dims(self.X, axis=1)
 
-        # rp_id -> [0..C-1]
-        uniq = np.sort(np.unique(self.y_raw[self.y_raw!=-1]))
-        self.id2idx = {rid:i for i, rid in enumerate(uniq)}
-        self.idx2id = {i:rid for rid, i in self.id2idx.items()}
-        # 不在映射的（例如 -1）設為 -1
+        uniq = np.sort(np.unique(self.y_raw[self.y_raw != -1]))
+        self.id2idx = {rid: i for i, rid in enumerate(uniq)}
+        self.idx2id = {i: rid for rid, i in self.id2idx.items()}
         self.y = np.array([self.id2idx.get(int(r), -1) for r in self.y_raw], dtype=np.int64)
 
     def __len__(self): return len(self.y)
+
     def __getitem__(self, i):
         return torch.from_numpy(self.X[i]), torch.tensor(self.y[i], dtype=torch.long)
+
 
 # ---------- Model ----------
 class MLPBlock(nn.Module):
@@ -97,40 +125,36 @@ class MLPBlock(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(p_drop)
         )
+
     def forward(self, x):
         return self.seq(x)
 
+
 class DNNClassifier(nn.Module):
     """
-    常見於 RSSI fingerprint 的 DNN：多層全連接（含 BN+ReLU+Dropout），
-    以全域特徵（所有 AP 向量）直接分類 RP。
+    RSSI fingerprint DNN 模型：多層全連接 + BN + ReLU + Dropout。
     """
-    def __init__(self, in_len: int, n_classes: int, hidden=[512, 256, 256], p_drop=0.2):
+    def __init__(self, in_len: int, n_classes: int, hidden=[512, 256], p_drop=0.2):
         super().__init__()
         dims = [in_len] + hidden
         blocks = []
         for a, b in zip(dims[:-1], dims[1:]):
             blocks.append(MLPBlock(a, b, p_drop=p_drop))
         self.feat = nn.Sequential(*blocks) if blocks else nn.Identity()
-        last_dim = dims[-1]
-        self.head = nn.Linear(last_dim, n_classes)
+        self.head = nn.Linear(dims[-1], n_classes)
 
     def forward(self, x):
-        # x: [B, 1, L] -> [B, L]
         if x.dim() == 3:
             x = x.squeeze(1)
         x = self.feat(x)
         logits = self.head(x)
         return logits
 
-# ---------- Metrics / Maps ----------
-def accuracy_from_logits(logits, y):
-    return (logits.argmax(dim=1) == y).float().mean().item()
 
+# ---------- Evaluation ----------
 def load_rp_map(rp_map_path: str):
-    """ 讀 rp_id 對應座標與樓層，回傳 dict: rid -> (x,y,floor) """
     df = pd.read_csv(rp_map_path, encoding="utf-8-sig")
-    need = {"rp_id","x","y","floor"}
+    need = {"rp_id", "x", "y", "floor"}
     if not need.issubset(df.columns):
         raise ValueError(f"rp_id.csv 缺少欄位（需要 {need}）")
     mp = {}
@@ -138,23 +162,21 @@ def load_rp_map(rp_map_path: str):
         mp[int(r["rp_id"])] = (float(r["x"]), float(r["y"]), int(r["floor"]))
     return mp
 
+
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_path", type=str, required=True)
-    parser.add_argument("--test_path",  type=str, required=True)
+    parser.add_argument("--test_path", type=str, required=True)
     parser.add_argument("--rp_map_path", type=str, default=r"C:\Users\Yinuo\Desktop\my_thesis\rp_id.csv")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
-    parser.add_argument("--out_dir", type=str, default="./rssi_dnn_baseline_ckpt")
-    # 可選：調整 DNN 寬度/深度與 dropout
+    parser.add_argument("--out_dir", type=str, default="./rssi_dnn_minmax_ckpt")
     parser.add_argument("--hidden", type=int, nargs="+", default=[512, 256, 128])
     parser.add_argument("--dropout", type=float, default=0.2)
     args = parser.parse_args()
-
-    #os.makedirs(args.out_dir, exist_ok=True)
 
     # --- Load data ---
     df_tr = load_csvs(args.train_path)
@@ -162,27 +184,24 @@ def main():
     ap_cols = get_feature_cols(df_tr)
     assert set(ap_cols).issubset(df_te.columns), "Test 缺少部分 AP 欄位"
 
-    # 類別檢查
     n_classes_tr = df_tr["rp_id"].nunique()
     if n_classes_tr != 48:
         print(f"[WARN] 訓練集 rp 類別數={n_classes_tr}（預期 48）")
 
     # --- Fit scaler on train ---
-    means, stds = fit_scaler(df_tr[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
-    #np.savez(os.path.join(args.out_dir, "scaler_ap_means_stds.npz"), means=means, stds=stds)
+    mins, maxs = fit_scaler(df_tr[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
 
     # --- Build train dataset/loader ---
-    ds_tr = RSSIDataset(df_tr, ap_cols, means=means, stds=stds, missing_val=args.missing_val)
+    ds_tr = RSSIDataset(df_tr, ap_cols, mins=mins, maxs=maxs, missing_val=args.missing_val)
     id2idx = ds_tr.id2idx
     idx2id = ds_tr.idx2id
     dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
-    # --- Prepare test arrays (只在最後 eval 用) ---
+    # --- Prepare test arrays ---
     X_te_full = df_te[ap_cols].values.astype(np.float32)
-    X_te_full = apply_scaler(X_te_full, means, stds, args.missing_val)
+    X_te_full = apply_scaler(X_te_full, mins, maxs, args.missing_val)
     X_te_full = np.expand_dims(X_te_full, axis=1)
 
-    # y 映射（未知類別或 -1 → -1）
     y_te_raw = df_te["rp_id"].astype(int).values if "rp_id" in df_te.columns else np.full(len(df_te), -1, dtype=int)
     y_te_idx = np.array([id2idx.get(int(r), -1) for r in y_te_raw], dtype=np.int64)
 
@@ -194,7 +213,7 @@ def main():
     ds_te = TestDataset()
     dl_te = DataLoader(ds_te, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
-    # --- Model / Optim ---
+    # --- Model / Optimizer ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DNNClassifier(in_len=len(ap_cols), n_classes=len(id2idx),
                           hidden=args.hidden, p_drop=args.dropout).to(device)
@@ -202,7 +221,7 @@ def main():
     crit = nn.CrossEntropyLoss()
 
     # --- Train ---
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
         tr_loss, tr_acc, n = 0.0, 0.0, 0
         for xb, yb in dl_tr:
@@ -210,7 +229,7 @@ def main():
             if not keep.any():
                 continue
             xb, yb = xb[keep], yb[keep]
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            xb, yb = xb.to(device), yb.to(device)
 
             opt.zero_grad()
             logits = model(xb)
@@ -220,13 +239,14 @@ def main():
 
             bs = yb.size(0)
             tr_loss += loss.item() * bs
-            tr_acc  += (logits.argmax(1) == yb).float().sum().item()
+            tr_acc += (logits.argmax(1) == yb).float().sum().item()
             n += bs
 
-        tr_loss, tr_acc = (tr_loss/n if n>0 else 0.0), (tr_acc/n if n>0 else 0.0)
+        tr_loss /= n
+        tr_acc /= n
         print(f"Epoch {epoch:03d} | train loss {tr_loss:.4f} acc {tr_acc:.4f}")
 
-    # --- Final Evaluation on Test (一次) ---
+    # --- Test ---
     model.eval()
     preds_idx, gts_idx, gts_rpid = [], [], []
     with torch.no_grad():
@@ -238,24 +258,17 @@ def main():
             gts_idx.append(yb_idx.numpy())
             gts_rpid.append(yb_rpid.numpy())
 
-    preds_idx = np.concatenate(preds_idx) if preds_idx else np.array([])
-    gts_idx   = np.concatenate(gts_idx) if gts_idx else np.array([])
-    gts_rpid  = np.concatenate(gts_rpid) if gts_rpid else np.array([])
+    preds_idx = np.concatenate(preds_idx)
+    gts_idx = np.concatenate(gts_idx)
+    gts_rpid = np.concatenate(gts_rpid)
 
-    # acc：僅計算 gts_idx != -1 的樣本
     eval_mask = (gts_idx != -1)
-    if eval_mask.any():
-        acc = (preds_idx[eval_mask] == gts_idx[eval_mask]).mean().item()
-    else:
-        acc = float("nan")
+    acc = (preds_idx[eval_mask] == gts_idx[eval_mask]).mean().item() if eval_mask.any() else float("nan")
 
-    # --- MDE 計算 ---
+    # --- MDE ---
     rp_map = load_rp_map(args.rp_map_path)
-    preds_rpid = np.array([idx2id[int(i)] if int(i) in idx2id else -999999 for i in preds_idx], dtype=int)
-
-    mde_distances = []
-    floor_mismatch = 0
-    mde_skipped_notfound = 0
+    preds_rpid = np.array([idx2id.get(int(i), -999999) for i in preds_idx], dtype=int)
+    mde_distances, floor_mismatch, mde_skipped_notfound = [], 0, 0
 
     for gt_id, pr_id, use in zip(gts_rpid, preds_rpid, eval_mask):
         if not use:
@@ -273,15 +286,16 @@ def main():
             d = sqrt((gx - px)**2 + (gy - py)**2)
             mde_distances.append(d)
 
-    avg_mde = (float(np.mean(mde_distances)) if len(mde_distances)>0 else float("nan"))
+    avg_mde = float(np.mean(mde_distances)) if mde_distances else float("nan")
 
-    print("==== Final Test Metrics ====")
+    print("\n==== Final Test Metrics ====")
     print(f"Test samples total          : {len(gts_idx)}")
     print(f"Evaluated (label available) : {int(eval_mask.sum())}")
     print(f"Test Accuracy               : {acc:.4f}" if not np.isnan(acc) else "Test Accuracy               : N/A")
-    print(f"Mean Distance Error (same floor only): {avg_mde:.4f} (meters)" if not np.isnan(avg_mde) else "Mean Distance Error (same floor only): N/A")
+    print(f"Mean Distance Error (same floor only): {avg_mde:.4f} m" if not np.isnan(avg_mde) else "Mean Distance Error (same floor only): N/A")
     print(f"Floor mismatches (excluded from MDE) : {floor_mismatch}")
     print(f"Skipped (rp_id not in rp_map)        : {mde_skipped_notfound}")
+
 
 if __name__ == "__main__":
     main()

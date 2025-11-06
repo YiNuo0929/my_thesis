@@ -7,8 +7,8 @@ import torch
 from dataio import load_csvs, get_feature_cols, set_seed
 from scaling import fit_scaler, apply_scaler
 from datasets import RSSISourceDataset, RSSITargetDataset, TestDataset
-#from models import FullModel, trans_FullModel
-from models2 import FullModel, trans_FullModel
+from models import FullModel, trans_FullModel
+#from models2 import FullModel, trans_FullModel
 from eval_utils import evaluate_classification, load_rp_map
 from train_loop import train_model
 
