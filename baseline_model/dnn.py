@@ -36,9 +36,14 @@ def load_csvs(path_like: str) -> pd.DataFrame:
 
 
 def get_feature_cols(df: pd.DataFrame):
-    ap_cols = [c for c in df.columns if c.startswith("ap")]
-    if not ap_cols:
-        raise ValueError("No AP columns (prefix 'ap') found.")
+    """
+    改成固定只抓 ap0 ~ ap255 共 256 維
+    """
+    all_cols = set(df.columns)
+    ap_cols = [f"ap{i}" for i in range(256)]
+    missing = [c for c in ap_cols if c not in all_cols]
+    if missing:
+        raise ValueError(f"資料集中缺少欄位（ap0~ap255）：{missing[:10]} ...")
     return ap_cols
 
 

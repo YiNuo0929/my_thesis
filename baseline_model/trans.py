@@ -22,9 +22,14 @@ def load_csvs(path_like: str) -> pd.DataFrame:
     return df
 
 def get_feature_cols(df: pd.DataFrame):
-    ap_cols = [c for c in df.columns if c.startswith("ap")]
-    if not ap_cols:
-        raise ValueError("No AP columns (prefix 'ap') found.")
+    """
+    改成固定只抓 ap0 ~ ap255 共 256 維
+    """
+    all_cols = set(df.columns)
+    ap_cols = [f"ap{i}" for i in range(256)]
+    missing = [c for c in ap_cols if c not in all_cols]
+    if missing:
+        raise ValueError(f"資料集中缺少欄位（ap0~ap255）：{missing[:10]} ...")
     return ap_cols
 
 def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
@@ -70,8 +75,8 @@ def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val:
     x = (x - mins) / denom
     x = np.clip(x, 0.0, 1.0)
 
-    # 缺失的地方直接設成 0
-    x[miss_mask] = 0.0
+    # 缺失的地方直接設成 -1
+    x[miss_mask] = -1.0
     return x
 
 class RSSIDataset(Dataset):
@@ -160,10 +165,10 @@ class TransformerExtractor(nn.Module):
         dim_feedforward: int,
         dropout: float,
         use_cls_token: bool,
+        mask_value: float,        # 哪個值當作 padding/missing
         z_dim: int,               # 壓縮後 latent 維度
         bottleneck_hidden: int = None,  # 中間 hidden 維度（如果 None 就用 d_model）
         use_mask: bool = False,
-        mask_value: float = 0.0,        # 哪個值當作 padding/missing
     ):
         super().__init__()
         self.use_cls_token = use_cls_token
@@ -290,7 +295,7 @@ class TransClassifier(nn.Module):
         mlp_hidden,
         p_drop: float,
         use_mask: bool,
-        mask_value: float = 0.0,
+        mask_value: float,
     ):
         super().__init__()
         # extractor：學 AP 間關係並壓成 z
@@ -353,8 +358,8 @@ def main():
 
     # Transformer 的超參數
     parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--nhead", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dim_feedforward", type=int, default=128)
 
     # 壓縮後 latent 維度 z_dim
@@ -369,7 +374,7 @@ def main():
     # --- Load data ---
     df_tr = load_csvs(args.train_path)
     df_te = load_csvs(args.test_path)
-    ap_cols = get_feature_cols(df_tr)
+    ap_cols = get_feature_cols(df_tr)   # 現在只會拿 ap0~ap255
     assert set(ap_cols).issubset(df_te.columns), "Test 缺少部分 AP 欄位"
 
     # 類別檢查
@@ -421,7 +426,7 @@ def main():
         mlp_hidden=args.hidden,
         p_drop=args.dropout,
         use_mask=args.use_mask,
-        mask_value=0.0,
+        mask_value=-1.0,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)

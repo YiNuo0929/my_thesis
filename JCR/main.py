@@ -102,6 +102,7 @@ def main():
     df_tgt = load_csvs(args.target_train_path)
     df_te = load_csvs(args.test_path)
     ap_cols = get_feature_cols(df_src)
+    print(f"有{len(ap_cols)}個ap數")
 
     # -------- Scaler --------
     # 各 domain 各自 fit min/max

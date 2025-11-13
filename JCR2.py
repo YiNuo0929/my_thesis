@@ -24,9 +24,14 @@ def load_csvs(path_like: str) -> pd.DataFrame:
     return df
 
 def get_feature_cols(df: pd.DataFrame):
-    ap_cols = [c for c in df.columns if c.startswith("ap")]
-    if not ap_cols:
-        raise ValueError("No AP columns (prefix 'ap') found.")
+    """
+    改成固定只抓 ap0 ~ ap255 共 256 維
+    """
+    all_cols = set(df.columns)
+    ap_cols = [f"ap{i}" for i in range(256)]
+    missing = [c for c in ap_cols if c not in all_cols]
+    if missing:
+        raise ValueError(f"資料集中缺少欄位（ap0~ap255）：{missing[:10]} ...")
     return ap_cols
 
 def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
@@ -69,7 +74,7 @@ def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val:
     x = (x - mins) / denom
     x = np.clip(x, 0.0, 1.0)
 
-    x[miss_mask] = 0.0
+    x[miss_mask] = -1.0
     return x
 
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask_val: float = 0.0):
@@ -172,9 +177,9 @@ class TransformerExtractor(nn.Module):
         dropout: float,
         use_cls_token: bool,
         z_dim: int,
+        mask_value: float,
         bottleneck_hidden: int = None,
         use_mask: bool = False,
-        mask_value: float = 0.0,
     ):
         super().__init__()
         self.use_cls_token = use_cls_token
@@ -304,7 +309,7 @@ class TransReconModel(nn.Module):
         p_drop: float,
         use_mask: bool,
         recon_hidden,
-        mask_value: float = 0.0
+        mask_value: float
     ):
         super().__init__()
         self.extractor = TransformerExtractor(
@@ -389,17 +394,17 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./result")
-    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
-    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--hidden", type=int, nargs="+", default=[512, 256, 128])
+    parser.add_argument("--dropout", type=float, default=0.3)
 
     # Transformer 超參
     parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--nhead", type=int, default=16)
-    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--nhead", type=int, default=2)
+    parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--dim_feedforward", type=int, default=128)
     parser.add_argument("--recon_hidden",type=int, nargs="+", default=[128])
 
-    parser.add_argument("--z_dim", type=int, default=16)
+    parser.add_argument("--z_dim", type=int, default=128)
 
     parser.add_argument("--use_mask", type=bool, default=True,
                         help="啟用 key_padding_mask，將值==0 的 AP 當作 padding/missing 忽略掉")
@@ -467,7 +472,7 @@ def main():
         mlp_hidden=args.hidden,
         p_drop=args.dropout,
         use_mask=args.use_mask,
-        mask_value=0.0,
+        mask_value= -1.0,
         recon_hidden=args.recon_hidden
     ).to(device)
 
