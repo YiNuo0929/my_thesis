@@ -8,6 +8,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from math import sqrt
+from itertools import cycle
+import random  # NEW
+
+# ---------- Reproducibility ----------
+def set_seed(seed: int = 42):
+    """
+    固定所有常見的隨機種子，讓實驗可重現。
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # 讓 cudnn 行為可重現
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # ---------- Utils ----------
 def load_csvs(path_like: str) -> pd.DataFrame:
@@ -76,6 +94,19 @@ def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val:
     x[miss_mask] = -1.0
     return x
 
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask_val: float = -1.0):
+    """
+    只在 target != mask_val 的位置上算 MSE。
+    這裡 mask_val=-1.0 對應「缺失 AP」。
+    pred, target 形狀一樣，例如 [B,1,L]
+    """
+    mask = (target != mask_val)
+    if not mask.any():
+        return torch.tensor(0.0, device=pred.device)
+    diff = (pred - target) ** 2
+    return diff[mask].mean()
+
+# ---------- Dataset ----------
 class RSSIDataset(Dataset):
     def __init__(self, df: pd.DataFrame, ap_cols, label_col="rp_id",
                  mins=None, maxs=None, missing_val=-110.0):
@@ -88,22 +119,37 @@ class RSSIDataset(Dataset):
         if (mins is not None) and (maxs is not None):
             self.X = apply_scaler(self.X, self.mins, self.maxs, self.missing_val)
 
-        # [N, 1, L]，之後在 ViT Extractor 裡再變成 16x16
+        # [N, 1, L]，ViT Extractor 會再 reshape 成 16x16
         self.X = np.expand_dims(self.X, axis=1)  # [N, 1, L]
 
-        uniq = np.sort(np.unique(self.y_raw[self.y_raw!=-1]))
-        self.id2idx = {rid:i for i, rid in enumerate(uniq)}
-        self.idx2id = {i:rid for rid, i in self.id2idx.items()}
+        uniq = np.sort(np.unique(self.y_raw[self.y_raw != -1]))
+        self.id2idx = {rid: i for i, rid in enumerate(uniq)}
+        self.idx2id = {i: rid for rid, i in self.id2idx.items()}
         self.y = np.array([self.id2idx.get(int(r), -1) for r in self.y_raw], dtype=np.int64)
 
-    def __len__(self): 
+    def __len__(self):
         return len(self.y)
 
     def __getitem__(self, i):
         return torch.from_numpy(self.X[i]), torch.tensor(self.y[i], dtype=torch.long)
 
-# ---------- Model Blocks ----------
+class RSSITargetDataset(Dataset):
+    """
+    專門給 target domain 用的 Dataset：只有 X，沒有 label。
+    """
+    def __init__(self, df: pd.DataFrame, ap_cols, mins=None, maxs=None, missing_val=-110.0):
+        X = df[ap_cols].values.astype(np.float32)
+        if (mins is not None) and (maxs is not None):
+            X = apply_scaler(X, mins, maxs, missing_val)
+        self.X = np.expand_dims(X, axis=1)  # [N, 1, L]
 
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        return torch.from_numpy(self.X[i])
+
+# ---------- Model Blocks ----------
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, out_dim, p_drop=0.2):
         super().__init__()
@@ -113,17 +159,18 @@ class MLPBlock(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(p_drop)
         )
+
     def forward(self, x):
         return self.seq(x)
 
-# -------- ViT-style Extractor (16x16, patch 4x4) --------
+# -------- ViT-style Extractor (16x16, patch PxP) --------
 class ViTExtractor(nn.Module):
     """
     把一維 RSSI (L tokens) reshape 成 16x16 圖，再用 ViT 風格處理：
     - 只取 ap0~ap255 → L=256 → 16x16
     - input:  x ∈ [B, 1, L] 或 [B, L]
     - 轉成影像 [B, 1, 16, 16]
-    - patchify: patch_size = 4 → 4x4 patch，共 (16/4)^2 = 16 個 patch token
+    - patchify: patch_size = P → PxP patch，共 (16/P)^2 個 patch token
     - Linear 映射到 d_model、加 CLS + learnable pos embedding
     - TransformerEncoder
     - 取 CLS → bottleneck MLP → z_dim
@@ -150,15 +197,15 @@ class ViTExtractor(nn.Module):
         side = int(math.isqrt(num_tokens))
         if side * side != num_tokens:
             raise ValueError(f"num_tokens={num_tokens} 不是完全平方數，無法 reshape 成方形圖。")
-        self.image_size = side      # 16
-        self.patch_size = patch_size  # 4
+        self.image_size = side
+        self.patch_size = patch_size
 
         if self.image_size % self.patch_size != 0:
             raise ValueError(f"image_size={self.image_size} 無法被 patch_size={self.patch_size} 整除。")
 
         self.in_chans = 1
-        self.num_patches = (self.image_size // self.patch_size) ** 2  # (16/4)^2 = 16
-        patch_dim = self.in_chans * (self.patch_size ** 2)           # 1 * (4*4) = 16
+        self.num_patches = (self.image_size // self.patch_size) ** 2
+        patch_dim = self.in_chans * (self.patch_size ** 2)
 
         # patch embedding：每個 patch flatten 後 Linear → d_model
         self.patch_embed = nn.Linear(patch_dim, d_model)
@@ -202,9 +249,9 @@ class ViTExtractor(nn.Module):
             raise ValueError(f"輸入長度 L={L} 與 image_size^2={self.image_size**2} 不符。")
 
         # reshape 成影像 [B, 1, 16, 16]
-        img = x.view(B, 1, self.image_size, self.image_size)  # [B,1,16,16]
+        img = x.view(B, 1, self.image_size, self.image_size)  # [B,1,H,W]
 
-        # patchify：使用 F.unfold，kernel_size = (4,4), stride = (4,4)
+        # patchify：使用 F.unfold，kernel_size=(P,P), stride=(P,P)
         patches = F.unfold(
             img,
             kernel_size=(self.patch_size, self.patch_size),
@@ -221,7 +268,6 @@ class ViTExtractor(nn.Module):
                 kernel_size=(self.patch_size, self.patch_size),
                 stride=(self.patch_size, self.patch_size)
             )
-            # [B, 1*ps*ps, N_patches] → 每個 patch 平均為 1 代表全部都是 mask
             mask_patches = (mask_patches.mean(dim=1) == 1.0)  # [B, N_patches] bool
             src_key_padding_mask = mask_patches  # 先不含 CLS
 
@@ -266,10 +312,34 @@ class PredictorMLP(nn.Module):
         logits = self.head(x)
         return logits
 
-# -------- 整體模型：ViT Extractor + PredictorMLP --------
-class TransClassifier(nn.Module):
+# -------- Reconstructor (z -> fingerprint) --------
+class Reconstructor(nn.Module):
     """
-    名稱沿用 TransClassifier，但 extractor 已經換成 ViT 版本 (16x16, patch 4x4)。
+    從 latent z 重建回原始 fingerprint：
+    - input:  z [B, z_dim]
+    - output: x_hat [B, 1, L]，這裡 L = num_ap = 256
+    """
+    def __init__(self, z_dim: int, num_ap: int, hidden=[256]):
+        super().__init__()
+        dims = [z_dim] + hidden + [num_ap]
+        layers = []
+        for a, b in zip(dims[:-2], dims[1:-1]):
+            layers += [nn.Linear(a, b), nn.ReLU(inplace=True)]
+        layers += [nn.Linear(dims[-2], dims[-1])]
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, z):
+        x_hat = self.mlp(z)        # [B, num_ap]
+        x_hat = x_hat.unsqueeze(1) # [B, 1, L]
+        return x_hat
+
+# -------- 整體模型：ViT Extractor + PredictorMLP + Reconstructor --------
+class TransReconClassifier(nn.Module):
+    """
+    - extractor：ViT 版本 (16x16, patch PxP)
+    - predictor：分類 head（做 RP 分類）
+    - reconstructor：重建 fingerprint 的分支
+    forward 回傳 (logits, x_hat)
     """
     def __init__(
         self,
@@ -286,6 +356,7 @@ class TransClassifier(nn.Module):
         use_mask: bool,
         mask_value: float,
         patch_size: int,
+        recon_hidden,
     ):
         super().__init__()
         self.extractor = ViTExtractor(
@@ -306,11 +377,17 @@ class TransClassifier(nn.Module):
             hidden=mlp_hidden,
             p_drop=p_drop,
         )
+        self.reconstructor = Reconstructor(
+            z_dim=z_dim,
+            num_ap=num_ap,
+            hidden=recon_hidden,
+        )
 
     def forward(self, x):
         z = self.extractor(x)
         logits = self.predictor(z)
-        return logits
+        x_hat = self.reconstructor(z)
+        return logits, x_hat
 
 # ---------- Metrics / Maps ----------
 def accuracy_from_logits(logits, y):
@@ -318,7 +395,7 @@ def accuracy_from_logits(logits, y):
 
 def load_rp_map(rp_map_path: str):
     df = pd.read_csv(rp_map_path, encoding="utf-8-sig")
-    need = {"rp_id","x","y","floor"}
+    need = {"rp_id", "x", "y", "floor"}
     if not need.issubset(df.columns):
         raise ValueError("rp_id.csv 缺少欄位（需要 {need}）")
     mp = {}
@@ -329,14 +406,16 @@ def load_rp_map(rp_map_path: str):
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_path", type=str, required=True)
+    parser.add_argument("--source_train_path", type=str, required=True)
+    parser.add_argument("--target_train_path", type=str, required=True)
     parser.add_argument("--test_path",  type=str, required=True)
     parser.add_argument("--rp_map_path", type=str, default=r"rp_id.csv")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
-    parser.add_argument("--out_dir", type=str, default="./rssi_dnn_baseline_ckpt")
+    parser.add_argument("--out_dir", type=str, default="./rssi_vit_recon_ckpt")
+
     # predictor MLP 的設定
     parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--dropout", type=float, default=0.2)
@@ -348,37 +427,57 @@ def main():
     parser.add_argument("--dim_feedforward", type=int, default=128)
     parser.add_argument("--z_dim", type=int, default=32)
 
-    # ViT patch 大小（4 → 4x4）
+    # ViT patch 大小（P → PxP）
     parser.add_argument("--patch_size", type=int, default=2)
 
     # 是否啟用 key_padding_mask（整個 patch 都是 -1 才會被 mask 掉）
-    parser.add_argument("--use_mask", type=bool, default=True,
-                        help="啟用 key_padding_mask，將值==mask_value 的 patch 當作 padding/missing 忽略掉")
+    parser.add_argument("--use_mask",action="store_true",help="啟用 key_padding_mask")
+
+    parser.add_argument("--seed", type=int, default=42,  # NEW
+                        help="random seed for reproducibility")
+
+    # Reconstructor hidden dims + λ
+    parser.add_argument("--recon_hidden", type=int, nargs="+", default=[256],
+                        help="reconstructor MLP hidden dims")
+    parser.add_argument("--lambda_recon", type=float, default=1.0,
+                        help="total loss = CE + lambda_recon * (recon_src + recon_tgt)")
 
     args = parser.parse_args()
+    set_seed(args.seed)
+    os.makedirs(args.out_dir, exist_ok=True)
 
     # --- Load data ---
-    df_tr = load_csvs(args.train_path)
-    df_te = load_csvs(args.test_path)
+    df_src = load_csvs(args.source_train_path)
+    df_tgt = load_csvs(args.target_train_path)
+    df_te  = load_csvs(args.test_path)
 
     # 只抓 ap0 ~ ap255
-    ap_cols = get_feature_cols_fixed_256(df_tr)
-    # 確認 test 也都有
-    assert set(ap_cols).issubset(df_te.columns), "Test 缺少部分 ap0~ap255 欄位"
+    ap_cols = get_feature_cols_fixed_256(df_src)
+    # 確認 target/test 也都有
+    assert set(ap_cols).issubset(df_te.columns),  "Test 缺少部分 ap0~ap255 欄位"
+    assert set(ap_cols).issubset(df_tgt.columns), "Target 缺少部分 ap0~ap255 欄位"
 
-    # 類別檢查
-    n_classes_tr = df_tr["rp_id"].nunique()
+    # 類別檢查（source）
+    n_classes_tr = df_src["rp_id"].nunique()
     if n_classes_tr != 48:
         print(f"[WARN] 訓練集 rp 類別數={n_classes_tr}（預期 48）")
 
-    # --- Fit scaler on train (Min-Max) ---
-    mins, maxs = fit_scaler(df_tr[ap_cols].values.astype(np.float32), missing_val=args.missing_val)
+    # --- Fit scaler on source train (Min-Max) ---
+    mins, maxs = fit_scaler(df_src[ap_cols].values.astype(np.float32),
+                            missing_val=args.missing_val)
 
-    # --- Build train dataset/loader ---
-    ds_tr = RSSIDataset(df_tr, ap_cols, mins=mins, maxs=maxs, missing_val=args.missing_val)
-    id2idx = ds_tr.id2idx
-    idx2id = ds_tr.idx2id
-    dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    # --- Build source / target dataset/loader ---
+    ds_src = RSSIDataset(df_src, ap_cols, mins=mins, maxs=maxs, missing_val=args.missing_val)
+    id2idx = ds_src.id2idx
+    idx2id = ds_src.idx2id
+    dl_src = DataLoader(ds_src, batch_size=args.batch_size, shuffle=True,
+                        num_workers=0, pin_memory=True)
+
+    ds_tgt = RSSITargetDataset(df_tgt, ap_cols, mins=mins, maxs=maxs,
+                               missing_val=args.missing_val)
+    dl_tgt = DataLoader(ds_tgt, batch_size=args.batch_size, shuffle=True,
+                        num_workers=0, pin_memory=True)
+    it_tgt = cycle(dl_tgt)
 
     # --- Prepare test arrays ---
     X_te_full_raw = df_te[ap_cols].values.astype(np.float32)
@@ -389,19 +488,20 @@ def main():
     y_te_idx = np.array([id2idx.get(int(r), -1) for r in y_te_raw], dtype=np.int64)
 
     class TestDataset(Dataset):
-        def __len__(self): 
+        def __len__(self):
             return len(y_te_idx)
         def __getitem__(self, i):
             return torch.from_numpy(X_te_full[i]), torch.tensor(y_te_idx[i], dtype=torch.long), int(y_te_raw[i])
 
     ds_te = TestDataset()
-    dl_te = DataLoader(ds_te, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    dl_te = DataLoader(ds_te, batch_size=args.batch_size, shuffle=False,
+                       num_workers=0, pin_memory=True)
 
     # --- Model / Optim ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_ap = len(ap_cols)  # 應該是 256
 
-    model = TransClassifier(
+    model = TransReconClassifier(
         num_ap=num_ap,
         n_classes=len(id2idx),
         d_model=args.d_model,
@@ -415,10 +515,11 @@ def main():
         use_mask=args.use_mask,
         mask_value=-1.0,
         patch_size=args.patch_size,
+        recon_hidden=args.recon_hidden,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    crit = nn.CrossEntropyLoss()
+    crit_ce = nn.CrossEntropyLoss()
 
     side = int(math.isqrt(num_ap))
     print("----------------config-----------------")
@@ -427,40 +528,81 @@ def main():
     print(f"d_model: {args.d_model}")
     print(f"num_layers: {args.num_layers}")
     print(f"nhead: {args.nhead}")
+    print(f"lambda_recon: {args.lambda_recon}")
     print(f"num_ap={num_ap}, image_shape={side}x{side}, patch={args.patch_size}x{args.patch_size}, num_patches={(side//args.patch_size)**2}")
     print("---------------------------------------")
+
     # --- Train ---
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        tr_loss, tr_acc, n = 0.0, 0.0, 0
-        for xb, yb in dl_tr:
-            keep = (yb != -1)
-            if not keep.any():
-                continue
-            xb, yb = xb[keep], yb[keep]
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        tr_loss, tr_ce, tr_acc = 0.0, 0.0, 0.0
+        tr_rec_s, tr_rec_t = 0.0, 0.0
+        n_ce = 0
+
+        for xb_s, yb_s in dl_src:
+            xb_t = next(it_tgt)
+
+            xb_s, yb_s = xb_s.to(device, non_blocking=True), yb_s.to(device, non_blocking=True)
+            xb_t = xb_t.to(device, non_blocking=True)
+
+            keep = (yb_s != -1)
 
             opt.zero_grad()
-            logits = model(xb)
-            loss = crit(logits, yb)
+
+            # ----- Source: 有 label，CE + reconstruction -----
+            logits_s, xhat_s = model(xb_s)
+            if keep.any():
+                ce_loss = crit_ce(logits_s[keep], yb_s[keep])
+                bs_ce = keep.sum().item()
+                tr_ce += ce_loss.item() * bs_ce
+                tr_acc += (logits_s[keep].argmax(1) == yb_s[keep]).float().sum().item()
+                n_ce += bs_ce
+            else:
+                ce_loss = torch.tensor(0.0, device=device)
+
+            rec_loss_s = masked_mse(xhat_s, xb_s, mask_val=-1.0)
+
+            # ----- Target: 無 label，只 reconstruction -----
+            _, xhat_t = model(xb_t)
+            rec_loss_t = masked_mse(xhat_t, xb_t, mask_val=-1.0)
+
+            rec_loss = rec_loss_s + rec_loss_t
+            loss = ce_loss + args.lambda_recon * rec_loss
+
             loss.backward()
             opt.step()
 
-            bs = yb.size(0)
-            tr_loss += loss.item() * bs
-            tr_acc  += (logits.argmax(1) == yb).float().sum().item()
-            n += bs
+            bs_s = xb_s.size(0)
+            tr_loss += loss.item() * bs_s
+            tr_rec_s += rec_loss_s.item() * bs_s
+            tr_rec_t += rec_loss_t.item() * xb_t.size(0)
 
-        tr_loss, tr_acc = (tr_loss/n if n>0 else 0.0), (tr_acc/n if n>0 else 0.0)
-        print(f"Epoch {epoch:03d} | train loss {tr_loss:.4f} acc {tr_acc:.4f}")
+        # epoch 統計
+        tr_loss = tr_loss / len(ds_src) if len(ds_src) > 0 else 0.0
+        tr_ce   = tr_ce   / n_ce        if n_ce > 0      else 0.0
+        tr_acc  = tr_acc  / n_ce        if n_ce > 0      else 0.0
+        tr_rec_s = tr_rec_s / len(ds_src) if len(ds_src) > 0 else 0.0
+        tr_rec_t = tr_rec_t / len(ds_tgt) if len(ds_tgt) > 0 else 0.0
 
-    # --- Final Evaluation on Test ---
+        # 你要的 print 形式
+        print(f"Epoch {epoch:03d} | total {tr_loss:.4f} | CE {tr_ce:.4f} acc {tr_acc:.4f} | "
+              f"recon_s {tr_rec_s:.4f} | recon_t {tr_rec_t:.4f}")
+
+        recon_weighted = args.lambda_recon * (tr_rec_s + tr_rec_t)
+        if (tr_ce + recon_weighted) > 0:
+            ratio = tr_ce / (tr_ce + recon_weighted)
+        else:
+            ratio = float('nan')
+        print(f"... | CE {tr_ce:.4f} | λ*recon {recon_weighted:.4f} | CE/(CE+λrecon) {ratio:.2f}")
+
+
+    # --- Final Evaluation on Test (只用分類分支) ---
     model.eval()
     preds_idx, gts_idx, gts_rpid = [], [], []
     with torch.no_grad():
         for xb, yb_idx, yb_rpid in dl_te:
             xb = xb.to(device)
-            logits = model(xb)
+            logits, _ = model(xb)
             pred = logits.argmax(1).cpu().numpy()
             preds_idx.append(pred)
             gts_idx.append(yb_idx.numpy())
@@ -496,10 +638,10 @@ def main():
         if gf != pf:
             floor_mismatch += 1
         else:
-            d = sqrt((gx - px)**2 + (gy - py)**2)
+            d = sqrt((gx - px) ** 2 + (gy - py) ** 2)
             mde_distances.append(d)
 
-    avg_mde = (float(np.mean(mde_distances)) if len(mde_distances)>0 else float("nan"))
+    avg_mde = (float(np.mean(mde_distances)) if len(mde_distances) > 0 else float("nan"))
 
     print("==== Final Test Metrics ====")
     print(f"Test samples total          : {len(gts_idx)}")

@@ -161,150 +161,49 @@ class MLPBlock(nn.Module):
     def forward(self, x):
         return self.seq(x)
 
-# -------- Positional Encoding --------
-class PositionalEncoding(nn.Module):
+# -------- DNN-based Extractor --------
+class DNNExtractor(nn.Module):
     """
-    標準 sin/cos 位置編碼，batch_first = True 對應 [B, L, d_model]
-    """
-    def __init__(self, d_model: int, max_len: int = 512):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)            # [max_len, d_model]
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # [max_len, 1]
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)   # [1, max_len, d_model]
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: [B, L, d_model]
-        """
-        L = x.size(1)
-        x = x + self.pe[:, :L, :]
-        return x
-
-# -------- Transformer-based Extractor + 壓縮 MLP + key_padding_mask --------
-class TransformerExtractor(nn.Module):
-    """
-    把每個 AP 當成一個 token：
-    - input:  [B, 1, L]  (L 個 AP)
-    - 資料已經是 [0,1] 或 -1 的 normalized 值，missing 的位置 = -1
-    - 先轉成 [B, L, 1] 再線性投影到 d_model 維度
-    - 加上位置編碼 + CLS
-    - 可選：use_mask=True 時，對 x==mask_value 做 key_padding_mask
-    - 通過 TransformerEncoder
-    - 取 CLS → 經 bottleneck MLP 壓成 z_dim
-    - output: z ∈ [B, z_dim]
+    DNN-based encoder：
+    - input:  [B, 1, L] 或 [B, L]（normalized）
+    - flatten → MLP → z_dim
     """
     def __init__(
         self,
-        num_tokens: int,          # AP 數量 = 序列長度 L
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        dim_feedforward: int,
-        dropout: float,
-        use_cls_token: bool,
-        mask_value: float,        # 哪個值當作 padding/missing
-        z_dim: int,               # 壓縮後 latent 維度
-        bottleneck_hidden: int = None,  # 中間 hidden 維度（如果 None 就用 d_model）
-        use_mask: bool = False,
+        num_ap: int,
+        z_dim: int,
+        hidden=[512, 512],
+        p_drop: float = 0.2,
     ):
         super().__init__()
-        self.use_cls_token = use_cls_token
-        self.d_model = d_model
+        self.num_ap = num_ap
         self.z_dim = z_dim
-        self.use_mask = use_mask
-        self.mask_value = mask_value
 
-        # 每個 RSSI scalar -> d_model 維
-        self.input_proj = nn.Linear(1, d_model)
-
-        # CLS token（可選）
-        if self.use_cls_token:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-            max_len = num_tokens + 1
-        else:
-            self.cls_token = None
-            max_len = num_tokens
-
-        self.pos_encoding = PositionalEncoding(d_model, max_len=max_len)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # ---- bottleneck MLP: CLS(d_model) → hidden → z_dim ----
-        if bottleneck_hidden is None:
-            bottleneck_hidden = d_model  # 預設 hidden = d_model
-
-        self.bottleneck = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, bottleneck_hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(bottleneck_hidden, z_dim)
-        )
+        dims = [num_ap] + hidden
+        blocks = []
+        for a, b in zip(dims[:-1], dims[1:]):
+            blocks.append(MLPBlock(a, b, p_drop=p_drop))
+        self.feat = nn.Sequential(*blocks) if blocks else nn.Identity()
+        self.proj = nn.Linear(dims[-1], z_dim)
 
     def forward(self, x: torch.Tensor):
         """
-        x: [B, 1, L] 或 [B, L]（normalized）
+        x: [B, 1, L] or [B, L]
         return: z ∈ [B, z_dim]
         """
         if x.dim() == 3:
             # [B, 1, L] -> [B, L]
             x = x.squeeze(1)
 
-        B, L = x.shape
-
-        # 根據值==mask_value 來決定要不要忽略（當 padding/missing）
-        key_padding_mask = None
-        if self.use_mask:
-            key_padding_mask = (x == self.mask_value)   # True 代表「忽略」
-
-        # [B, L] -> [B, L, 1] -> [B, L, d_model]
-        x = x.unsqueeze(-1)
-        h = self.input_proj(x)
-
-        # 加 CLS token
-        if self.use_cls_token:
-            cls = self.cls_token.expand(B, 1, self.d_model)   # [B, 1, d_model]
-            h = torch.cat([cls, h], dim=1)                    # [B, 1+L, d_model]
-
-        # 位置編碼
-        h = self.pos_encoding(h)                              # [B, T, d_model]
-
-        # 準備給 encoder 的 key_padding_mask
-        src_key_padding_mask = None
-        if key_padding_mask is not None:
-            if self.use_cls_token:
-                pad = torch.zeros(B, 1, dtype=torch.bool, device=h.device)
-                src_key_padding_mask = torch.cat([pad, key_padding_mask], dim=1)  # [B, 1+L]
-            else:
-                src_key_padding_mask = key_padding_mask                             # [B, L]
-
-        # Encoder
-        h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)  # [B, T, d_model]
-
-        # 取 CLS 或 mean pooling
-        if self.use_cls_token:
-            cls_feat = h[:, 0, :]                    # [B, d_model]
-        else:
-            cls_feat = h.mean(dim=1)                 # [B, d_model]
-
-        # 經 bottleneck MLP 壓縮成 z
-        z = self.bottleneck(cls_feat)                # [B, z_dim]
+        # x: [B, L]
+        h = self.feat(x)           # [B, hidden_last]
+        z = self.proj(h)           # [B, z_dim]
         return z
 
 # -------- Predictor (MLP head) --------
 class PredictorMLP(nn.Module):
     """
-    接 transformer 抽出來的全局特徵 z [B, z_dim]，
+    接 encoder 抽出來的全局特徵 z [B, z_dim]，
     再接幾層 MLP + 最後分類器。
     """
     def __init__(self, in_dim: int, n_classes: int, hidden=[256, 256], p_drop=0.2):
@@ -341,38 +240,25 @@ class ReconstructionMLP(nn.Module):
         out = self.head(x)   # [B, out_dim]
         return out
 
-# -------- 整體模型 = TransformerExtractor(產生 z) + PredictorMLP + ReconstructionMLP --------
-class TransClassifier(nn.Module):
+# -------- 整體模型 = DNNExtractor(產生 z) + PredictorMLP + ReconstructionMLP --------
+class DNNClassifier(nn.Module):
     def __init__(
         self,
         num_ap: int,
         n_classes: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        dim_feedforward: int,
-        dropout: float,
         z_dim: int,           # 壓縮後 latent 維度
+        enc_hidden,
         pred_hidden,
         recon_hidden,
         p_drop: float,
-        use_mask: bool,
-        mask_value: float,
     ):
         super().__init__()
-        # extractor：學 AP 間關係並壓成 z
-        self.extractor = TransformerExtractor(
-            num_tokens=num_ap,
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=num_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            use_cls_token=True,
+        # encoder：學 AP 間關係並壓成 z（DNN-base）
+        self.extractor = DNNExtractor(
+            num_ap=num_ap,
             z_dim=z_dim,
-            bottleneck_hidden=None,  # 預設 hidden = d_model
-            use_mask=use_mask,
-            mask_value=mask_value
+            hidden=enc_hidden,
+            p_drop=p_drop,
         )
         # predictor：分類 head，用 pred_hidden
         self.predictor = PredictorMLP(
@@ -427,7 +313,7 @@ def reconstruction_loss(pred, target, mask_value=-1.0):
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser()
-    # 這裡改成 Source / Target 兩個 train path
+    # Source / Target 兩個 train path
     parser.add_argument("--source_train_path", type=str, required=True,
                         help="source domain train csv (有 label)")
     parser.add_argument("--target_train_path", type=str, required=True,
@@ -438,31 +324,24 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
-    parser.add_argument("--out_dir", type=str, default="./rssi_trans_recon_ckpt")
+    parser.add_argument("--out_dir", type=str, default="./rssi_dnn_recon_ckpt")
     parser.add_argument("--column", type=int, default=256)
 
-    # predictor / recon MLP 的設定（已拆開）
+    # encoder / predictor / recon MLP 的設定（全部拆開）
+    parser.add_argument("--enc_hidden", type=int, nargs="+", default=[512, 512],
+                        help="hidden sizes for encoder (DNN extractor)")
     parser.add_argument("--pred_hidden", type=int, nargs="+", default=[256, 256],
                         help="hidden sizes for predictor MLP")
-    parser.add_argument("--recon_hidden", type=int, nargs="+", default=[256],
+    parser.add_argument("--recon_hidden", type=int, nargs="+", default=[256, 256],
                         help="hidden sizes for reconstruction MLP")
     parser.add_argument("--dropout", type=float, default=0.2)
 
-    # Transformer 的超參數
-    parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--dim_feedforward", type=int, default=128)
-
     # 壓縮後 latent 維度 z_dim
-    parser.add_argument("--z_dim", type=int, default=64)
+    parser.add_argument("--z_dim", type=int, default=32)
 
     # reconstruction loss 的權重 λ
     parser.add_argument("--lambda_recon", type=float, default=0.1)
 
-    # 是否啟用 key_padding_mask
-    parser.add_argument("--use_mask", action="store_true", help="啟用 key_padding_mask")
-    
     parser.add_argument("--seed", type=int, default=42,
                         help="random seed for reproducibility")
 
@@ -518,30 +397,23 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_ap = len(ap_cols)
 
-    model = TransClassifier(
+    model = DNNClassifier(
         num_ap=num_ap,
         n_classes=len(id2idx),
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-        dim_feedforward=args.dim_feedforward,
-        dropout=args.dropout,
         z_dim=args.z_dim,
+        enc_hidden=args.enc_hidden,
         pred_hidden=args.pred_hidden,
         recon_hidden=args.recon_hidden,
         p_drop=args.dropout,
-        use_mask=args.use_mask,
-        mask_value=-1.0,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
 
     print("---------------------------------------")
-    print(f"use mask or not: {model.extractor.use_mask}")
     print(f"z_dim: {model.extractor.z_dim}")
-    print(f"d_model: {model.extractor.d_model}")
     print(f"num_ap={num_ap}")
+    print(f"enc_hidden={args.enc_hidden}")
     print(f"pred_hidden={args.pred_hidden}, recon_hidden={args.recon_hidden}")
     print("---------------------------------------")
 

@@ -5,6 +5,7 @@ import pandas as pd
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from math import sqrt
 import random  # NEW
@@ -38,20 +39,20 @@ def load_csvs(path_like: str) -> pd.DataFrame:
         df = pd.read_csv(p, encoding="utf-8-sig")
     return df
 
-def get_feature_cols(df: pd.DataFrame, col):
+def get_feature_cols_fixed_256(df: pd.DataFrame):
     """
-    改成固定只抓 ap0 ~ ap255 共 256 維
+    只抓 ap0 ~ ap167 共 168 維
     """
-    all_cols = set(df.columns)
-    ap_cols = [f"ap{i}" for i in range(col)]
-    missing = [c for c in ap_cols if c not in all_cols]
+    ap_cols_all = set(df.columns)
+    ap_cols = [f"ap{i}" for i in range(168)]
+    missing = [c for c in ap_cols if c not in ap_cols_all]
     if missing:
-        raise ValueError(f"資料集中缺少欄位（ap0~ap255）：{missing[:10]} ...")
+        raise ValueError(f"資料集中缺少欄位: {missing[:10]} ...")
     return ap_cols
 
 def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
     """
-    改成 Min-Max scaler：
+    Min-Max scaler：
     - 只用非 missing_val 的值算 per-AP min / max
     - 之後會把資料壓到 [0,1]
     """
@@ -68,10 +69,8 @@ def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
             vmin = v.min()
             vmax = v.max()
             if abs(vmax - vmin) < 1e-6:
-                # 避免分母為 0
                 vmax = vmin + 1.0
         else:
-            # 該 AP 完全沒有有效值，給個 dummy 範圍
             vmin, vmax = 0.0, 1.0
         mins[j] = vmin
         maxs[j] = vmax
@@ -79,20 +78,18 @@ def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
 
 def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val: float = -110.0):
     """
-    Min-Max 正規化到 [0,1]，缺失值補 0：
-    - 對非 missing 的位置做 (x - min) / (max - min)，clip 到 [0,1]
-    - 原本是 missing_val 的位置，最後強制設為 0
+    Min-Max 正規化到 [0,1]：
+    - 對非 missing 的位置做 (x - min) / (max - max)，clip 到 [0,1]
+    - 原本是 missing_val 的位置最後設為 -1（給 mask 用）
     """
     x = x.copy().astype(np.float32)
     miss_mask = (x == missing_val)
 
-    # Min-Max scaling
     denom = (maxs - mins)
-    denom[denom == 0.0] = 1.0  # safety
+    denom[denom == 0.0] = 1.0
     x = (x - mins) / denom
     x = np.clip(x, 0.0, 1.0)
 
-    # 缺失的地方直接設成 -1
     x[miss_mask] = -1.0
     return x
 
@@ -107,17 +104,16 @@ class RSSIDataset(Dataset):
         self.maxs = maxs
         if (mins is not None) and (maxs is not None):
             self.X = apply_scaler(self.X, self.mins, self.maxs, self.missing_val)
-        # 與 CNN 版對齊：維度 [N, 1, L]；之後在 model 內再 squeeze
-        self.X = np.expand_dims(self.X, axis=1)
 
-        # rp_id -> [0..C-1]
-        uniq = np.sort(np.unique(self.y_raw[self.y_raw!=-1]))
-        self.id2idx = {rid:i for i, rid in enumerate(uniq)}
-        self.idx2id = {i:rid for rid, i in self.id2idx.items()}
-        # 不在映射的（例如 -1）設為 -1
+        # [N, 1, L]，在 ViT Extractor 裡再變成 4x42
+        self.X = np.expand_dims(self.X, axis=1)  # [N, 1, L]
+
+        uniq = np.sort(np.unique(self.y_raw[self.y_raw != -1]))
+        self.id2idx = {rid: i for i, rid in enumerate(uniq)}
+        self.idx2id = {i: rid for rid, i in self.id2idx.items()}
         self.y = np.array([self.id2idx.get(int(r), -1) for r in self.y_raw], dtype=np.int64)
 
-    def __len__(self): 
+    def __len__(self):
         return len(self.y)
 
     def __getitem__(self, i):
@@ -134,78 +130,64 @@ class MLPBlock(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(p_drop)
         )
+
     def forward(self, x):
         return self.seq(x)
 
-# -------- Positional Encoding --------
-class PositionalEncoding(nn.Module):
+# -------- ViT-style Extractor (4x42, patch 2x2) --------
+class ViTExtractor(nn.Module):
     """
-    標準 sin/cos 位置編碼，batch_first = True 對應 [B, L, d_model]
-    """
-    def __init__(self, d_model: int, max_len: int = 512):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)            # [max_len, d_model]
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # [max_len, 1]
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)   # [1, max_len, d_model]
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: [B, L, d_model]
-        """
-        L = x.size(1)
-        x = x + self.pe[:, :L, :]
-        return x
-
-# -------- Transformer-based Extractor + 壓縮 MLP + key_padding_mask --------
-class TransformerExtractor(nn.Module):
-    """
-    把每個 AP 當成一個 token：
-    - input:  [B, 1, L]  (L 個 AP)
-    - 資料已經是 [0,1] 的 normalized 值，missing 的位置 = 0
-    - 先轉成 [B, L, 1] 再線性投影到 d_model 維度
-    - 加上位置編碼 + (可選) CLS
-    - 可選：use_mask=True 時，對 x==mask_value 做 key_padding_mask
-    - 通過 TransformerEncoder
-    - 取 CLS → 經 bottleneck MLP 壓成 z_dim
-    - output: z ∈ [B, z_dim]
+    把一維 RSSI (L tokens) reshape 成 4x42 圖，再用 ViT 風格處理：
+    - 只取 ap0~ap167 → L=168 → 4x42
+    - input:  x ∈ [B, 1, L] 或 [B, L]
+    - 轉成影像 [B, 1, 4, 42]
+    - patchify: patch_size = 2 → 2x2 patch
+      H=4,W=42 → (4/2)*(42/2) = 2*21 = 42 個 patch token
+    - Linear 映射到 d_model、加 CLS + learnable pos embedding
+    - TransformerEncoder
+    - 取 CLS → bottleneck MLP → z_dim
     """
     def __init__(
         self,
-        num_tokens: int,          # AP 數量 = 序列長度 L
+        num_tokens: int,          # 期望 = 168
         d_model: int,
         nhead: int,
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
-        use_cls_token: bool,
-        mask_value: float,        # 哪個值當作 padding/missing
-        z_dim: int,               # 壓縮後 latent 維度
-        bottleneck_hidden: int = None,  # 中間 hidden 維度（如果 None 就用 d_model）
-        use_mask: bool = False,
+        z_dim: int,
+        patch_size: int,
+        use_mask: bool = True,
+        mask_value: float = -1.0,
     ):
         super().__init__()
-        self.use_cls_token = use_cls_token
-        self.d_model = d_model
-        self.z_dim = z_dim
         self.use_mask = use_mask
         self.mask_value = mask_value
+        self.d_model = d_model
 
-        # 每個 RSSI scalar -> d_model 維
-        self.input_proj = nn.Linear(1, d_model)
+        # 固定用 4x42
+        self.image_h = 12
+        if num_tokens % self.image_h != 0:
+            raise ValueError(f"num_tokens={num_tokens} 無法整除成 4xW 的結構。")
+        self.image_w = num_tokens // self.image_h   # 168/4 = 42
 
-        # CLS token（可選）
-        if self.use_cls_token:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-            max_len = num_tokens + 1
-        else:
-            self.cls_token = None
-            max_len = num_tokens
+        self.patch_size = patch_size                # 2
+        self.in_chans = 1
 
-        self.pos_encoding = PositionalEncoding(d_model, max_len=max_len)
+        if self.image_h % self.patch_size != 0 or self.image_w % self.patch_size != 0:
+            raise ValueError(
+                f"image_h={self.image_h}, image_w={self.image_w} 無法被 patch_size={self.patch_size} 整除。"
+            )
+
+        self.num_patches = (self.image_h // self.patch_size) * (self.image_w // self.patch_size)
+        patch_dim = self.in_chans * (self.patch_size ** 2)  # 1 * (2*2) = 4
+
+        # patch embedding：每個 patch flatten 後 Linear → d_model
+        self.patch_embed = nn.Linear(patch_dim, d_model)
+
+        # CLS token + learnable pos embedding（ViT 標準作法）
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -216,73 +198,83 @@ class TransformerExtractor(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # ---- bottleneck MLP: CLS(d_model) → hidden → z_dim ----
-        if bottleneck_hidden is None:
-            bottleneck_hidden = d_model  # 預設 hidden = d_model
-
+        # bottleneck: CLS(d_model) → z_dim
         self.bottleneck = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Linear(d_model, bottleneck_hidden),
+            nn.Linear(d_model, d_model),
             nn.ReLU(inplace=True),
-            nn.Linear(bottleneck_hidden, z_dim)
+            nn.Linear(d_model, z_dim)
         )
+
+        # 參數初始化（簡單一點：normal 初始化 pos & cls）
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
 
     def forward(self, x: torch.Tensor):
         """
-        x: [B, 1, L] 或 [B, L]（已經是 [0,1] normalized）
-        return: z ∈ [B, z_dim]  (整個 fingerprint 的壓縮向量)
+        x: [B, 1, L] or [B, L], L 應該是 168
+        return: z ∈ [B, z_dim]
         """
         if x.dim() == 3:
             # [B, 1, L] -> [B, L]
             x = x.squeeze(1)
 
         B, L = x.shape
+        expected_L = self.image_h * self.image_w  # 4*42 = 168
+        if L != expected_L:
+            raise ValueError(f"輸入長度 L={L} 與 image_h*image_w={expected_L} 不符。")
 
-        # 根據值==mask_value 來決定要不要忽略（當 padding/missing）
-        key_padding_mask = None
-        if self.use_mask:
-            key_padding_mask = (x == self.mask_value)   # True 代表「忽略」
+        # reshape 成影像 [B, 1, 4, 42]
+        img = x.view(B, 1, self.image_h, self.image_w)  # [B,1,4,42]
 
-        # [B, L] -> [B, L, 1] -> [B, L, d_model]
-        x = x.unsqueeze(-1)
-        h = self.input_proj(x)
+        # patchify：使用 F.unfold，kernel_size = (2,2), stride = (2,2)
+        patches = F.unfold(
+            img,
+            kernel_size=(self.patch_size, self.patch_size),
+            stride=(self.patch_size, self.patch_size)
+        )  # [B, C*ps*ps, N_patches]
+        patches = patches.transpose(1, 2)  # [B, N_patches, patch_dim]
 
-        # 加 CLS token
-        if self.use_cls_token:
-            cls = self.cls_token.expand(B, 1, self.d_model)   # [B, 1, d_model]
-            h = torch.cat([cls, h], dim=1)                    # [B, 1+L, d_model]
-
-        # 位置編碼
-        h = self.pos_encoding(h)                              # [B, T, d_model]
-
-        # 準備給 encoder 的 key_padding_mask
+        # patch-level mask（如果整個 patch 都是 mask_value，就當成 padding）
         src_key_padding_mask = None
-        if key_padding_mask is not None:
-            if self.use_cls_token:
-                pad = torch.zeros(B, 1, dtype=torch.bool, device=h.device)
-                src_key_padding_mask = torch.cat([pad, key_padding_mask], dim=1)  # [B, 1+L]
-            else:
-                src_key_padding_mask = key_padding_mask                             # [B, L]
+        if self.use_mask:
+            mask_map = (img == self.mask_value).float()  # [B,1,H,W]
+            mask_patches = F.unfold(
+                mask_map,
+                kernel_size=(self.patch_size, self.patch_size),
+                stride=(self.patch_size, self.patch_size)
+            )
+            # [B, 1*ps*ps, N_patches] → 每個 patch 平均為 1 代表全部都是 mask
+            mask_patches = (mask_patches.mean(dim=1) == 1.0)  # [B, N_patches] bool
+            src_key_padding_mask = mask_patches  # 先不含 CLS
 
-        # Encoder
-        h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)  # [B, T, d_model]
+        # patch → embedding
+        h = self.patch_embed(patches)  # [B, N_patches, d_model]
 
-        # 取 CLS 或 mean pooling
-        if self.use_cls_token:
-            cls_feat = h[:, 0, :]                    # [B, d_model]
-        else:
-            cls_feat = h.mean(dim=1)                 # [B, d_model]
+        # CLS token
+        cls = self.cls_token.expand(B, 1, self.d_model)  # [B,1,d_model]
+        h = torch.cat([cls, h], dim=1)                   # [B, 1+N_patches, d_model]
 
-        # 經 bottleneck MLP 壓縮成 z
-        z = self.bottleneck(cls_feat)                # [B, z_dim]
+        # pos embedding
+        h = h + self.pos_embed  # [B, 1+N_patches, d_model]
+
+        # 準備 key_padding_mask（要補 CLS 的 False）
+        if src_key_padding_mask is not None:
+            pad_cls = torch.zeros(B, 1, dtype=torch.bool, device=h.device)
+            src_key_padding_mask = torch.cat([pad_cls, src_key_padding_mask], dim=1)  # [B, 1+N]
+
+        # ViT backbone = TransformerEncoder
+        h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)  # [B, 1+N_patches, d_model]
+
+        # 取 CLS
+        cls_feat = h[:, 0, :]  # [B, d_model]
+
+        # bottleneck → z
+        z = self.bottleneck(cls_feat)  # [B, z_dim]
         return z
 
 # -------- Predictor (MLP head) --------
 class PredictorMLP(nn.Module):
-    """
-    接 transformer 抽出來的全局特徵 z [B, z_dim]，
-    再接幾層 MLP + 最後分類器。
-    """
     def __init__(self, in_dim: int, n_classes: int, hidden=[256, 256], p_drop=0.2):
         super().__init__()
         dims = [in_dim] + hidden
@@ -297,8 +289,11 @@ class PredictorMLP(nn.Module):
         logits = self.head(x)
         return logits
 
-# -------- 整體模型 = TransformerExtractor(產生 z) + PredictorMLP --------
+# -------- 整體模型：ViT Extractor + PredictorMLP --------
 class TransClassifier(nn.Module):
+    """
+    名稱沿用 TransClassifier，但 extractor 已經換成 ViT 版本 (4x42, patch 2x2)。
+    """
     def __init__(
         self,
         num_ap: int,
@@ -308,28 +303,26 @@ class TransClassifier(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
-        z_dim: int,           # 壓縮後 latent 維度
+        z_dim: int,
         mlp_hidden,
         p_drop: float,
         use_mask: bool,
         mask_value: float,
+        patch_size: int,
     ):
         super().__init__()
-        # extractor：學 AP 間關係並壓成 z
-        self.extractor = TransformerExtractor(
+        self.extractor = ViTExtractor(
             num_tokens=num_ap,
             d_model=d_model,
             nhead=nhead,
             num_layers=num_layers,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            use_cls_token=True,
             z_dim=z_dim,
-            bottleneck_hidden=None,  # 預設 hidden = d_model
+            patch_size=patch_size,
             use_mask=use_mask,
-            mask_value=mask_value
+            mask_value=mask_value,
         )
-        # predictor：接上 MLP head 做分類（吃 z_dim）
         self.predictor = PredictorMLP(
             in_dim=z_dim,
             n_classes=n_classes,
@@ -338,8 +331,7 @@ class TransClassifier(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B, 1, L]
-        z = self.extractor(x)     # [B, z_dim]
+        z = self.extractor(x)
         logits = self.predictor(z)
         return logits
 
@@ -348,11 +340,10 @@ def accuracy_from_logits(logits, y):
     return (logits.argmax(dim=1) == y).float().mean().item()
 
 def load_rp_map(rp_map_path: str):
-    """ 讀 rp_id 對應座標與樓層，回傳 dict: rid -> (x,y,floor) """
     df = pd.read_csv(rp_map_path, encoding="utf-8-sig")
-    need = {"rp_id","x","y","floor"}
+    need = {"rp_id", "x", "y", "floor"}
     if not need.issubset(df.columns):
-        raise ValueError("rp_id.csv 缺少欄位（需要 {need}）")
+        raise ValueError(f"rp_id.csv 缺少欄位（需要 {need}）")
     mp = {}
     for _, r in df.iterrows():
         mp[int(r["rp_id"])] = (float(r["x"]), float(r["y"]), int(r["floor"]))
@@ -369,34 +360,37 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./rssi_dnn_baseline_ckpt")
-    parser.add_argument("--column", type=int, default=256)
     # predictor MLP 的設定
     parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--dropout", type=float, default=0.2)
 
-    # Transformer 的超參數
+    # Transformer / ViT 的超參數
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dim_feedforward", type=int, default=128)
-
-    # 壓縮後 latent 維度 z_dim
     parser.add_argument("--z_dim", type=int, default=32)
-
-    # 是否啟用 key_padding_mask
-    parser.add_argument("--use_mask",action="store_true",help="啟用 key_padding_mask")
     
+    # ViT patch 大小（2 → 2x2）
+    parser.add_argument("--patch_size", type=int, default=2)
+
+    # 是否啟用 key_padding_mask（整個 patch 都是 -1 才會被 mask 掉）
+    parser.add_argument("--use_mask",action="store_true",help="啟用 key_padding_mask")
+
     parser.add_argument("--seed", type=int, default=42,  # NEW
                         help="random seed for reproducibility")
 
     args = parser.parse_args()
-    set_seed(args.seed)  # NEW：一進 main 就固定亂數
+    set_seed(args.seed)
 
     # --- Load data ---
     df_tr = load_csvs(args.train_path)
     df_te = load_csvs(args.test_path)
-    ap_cols = get_feature_cols(df_tr, args.column)   # 現在只會拿 ap0~ap255
-    assert set(ap_cols).issubset(df_te.columns), "Test 缺少部分 AP 欄位"
+
+    # 只抓 ap0 ~ ap167
+    ap_cols = get_feature_cols_fixed_256(df_tr)
+    # 確認 test 也都有
+    assert set(ap_cols).issubset(df_te.columns), "Test 缺少部分 ap0~ap167 欄位"
 
     # 類別檢查
     n_classes_tr = df_tr["rp_id"].nunique()
@@ -412,18 +406,18 @@ def main():
     idx2id = ds_tr.idx2id
     dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
-    # --- Prepare test arrays (只在最後 eval 用) ---
+    # --- Prepare test arrays ---
     X_te_full_raw = df_te[ap_cols].values.astype(np.float32)
     X_te_full = apply_scaler(X_te_full_raw, mins, maxs, args.missing_val)
-    X_te_full = np.expand_dims(X_te_full, axis=1)
+    X_te_full = np.expand_dims(X_te_full, axis=1)  # [N,1,L]
 
-    # y 映射（未知類別或 -1 → -1）
     y_te_raw = df_te["rp_id"].astype(int).values if "rp_id" in df_te.columns else np.full(len(df_te), -1, dtype=int)
     y_te_idx = np.array([id2idx.get(int(r), -1) for r in y_te_raw], dtype=np.int64)
 
     class TestDataset(Dataset):
-        def __len__(self): 
+        def __len__(self):
             return len(y_te_idx)
+
         def __getitem__(self, i):
             return torch.from_numpy(X_te_full[i]), torch.tensor(y_te_idx[i], dtype=torch.long), int(y_te_raw[i])
 
@@ -432,9 +426,8 @@ def main():
 
     # --- Model / Optim ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_ap = len(ap_cols)
+    num_ap = len(ap_cols)  # 應該是 168
 
-    # 使用 Transformer-based 模型（含壓縮 bottleneck + 可選 mask）
     model = TransClassifier(
         num_ap=num_ap,
         n_classes=len(id2idx),
@@ -448,18 +441,33 @@ def main():
         p_drop=args.dropout,
         use_mask=args.use_mask,
         mask_value=-1.0,
+        patch_size=args.patch_size,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
 
+    H = model.extractor.image_h
+    W = model.extractor.image_w
+    print("----------------config-----------------")
     print(f"use mask or not: {model.extractor.use_mask}")
+    print(f"z_dim: {args.z_dim}")
+    print(f"d_model: {args.d_model}")
+    print(f"num_layers: {args.num_layers}")
+    print(f"nhead: {args.nhead}")
+    print(
+        f"num_ap={num_ap}, image_shape={H}x{W}, "
+        f"patch={args.patch_size}x{args.patch_size}, "
+        f"num_patches={model.extractor.num_patches}"
+    )
+    print("---------------------------------------")
+
     # --- Train ---
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
         tr_loss, tr_acc, n = 0.0, 0.0, 0
         for xb, yb in dl_tr:
-            keep = yb != -1
+            keep = (yb != -1)
             if not keep.any():
                 continue
             xb, yb = xb[keep], yb[keep]
@@ -473,13 +481,13 @@ def main():
 
             bs = yb.size(0)
             tr_loss += loss.item() * bs
-            tr_acc  += (logits.argmax(1) == yb).float().sum().item()
+            tr_acc += (logits.argmax(1) == yb).float().sum().item()
             n += bs
 
-        tr_loss, tr_acc = (tr_loss/n if n>0 else 0.0), (tr_acc/n if n>0 else 0.0)
+        tr_loss, tr_acc = (tr_loss / n if n > 0 else 0.0), (tr_acc / n if n > 0 else 0.0)
         print(f"Epoch {epoch:03d} | train loss {tr_loss:.4f} acc {tr_acc:.4f}")
 
-    # --- Final Evaluation on Test (一次) ---
+    # --- Final Evaluation on Test ---
     model.eval()
     preds_idx, gts_idx, gts_rpid = [], [], []
     with torch.no_grad():
@@ -492,17 +500,15 @@ def main():
             gts_rpid.append(yb_rpid.numpy())
 
     preds_idx = np.concatenate(preds_idx) if preds_idx else np.array([])
-    gts_idx   = np.concatenate(gts_idx) if gts_idx else np.array([])
-    gts_rpid  = np.concatenate(gts_rpid) if gts_rpid else np.array([])
+    gts_idx = np.concatenate(gts_idx) if gts_idx else np.array([])
+    gts_rpid = np.concatenate(gts_rpid) if gts_rpid else np.array([])
 
-    # acc：僅計算 gts_idx != -1 的樣本
     eval_mask = (gts_idx != -1)
     if eval_mask.any():
         acc = (preds_idx[eval_mask] == gts_idx[eval_mask]).mean().item()
     else:
         acc = float("nan")
 
-    # --- MDE 計算 ---
     rp_map = load_rp_map(args.rp_map_path)
     preds_rpid = np.array([idx2id.get(int(i), -999999) for i in preds_idx], dtype=int)
 
@@ -523,16 +529,22 @@ def main():
         if gf != pf:
             floor_mismatch += 1
         else:
-            d = sqrt((gx - px)**2 + (gy - py)**2)
+            d = sqrt((gx - px) ** 2 + (gy - py) ** 2)
             mde_distances.append(d)
 
-    avg_mde = (float(np.mean(mde_distances)) if len(mde_distances)>0 else float("nan"))
+    avg_mde = (float(np.mean(mde_distances)) if len(mde_distances) > 0 else float("nan"))
 
     print("==== Final Test Metrics ====")
     print(f"Test samples total          : {len(gts_idx)}")
     print(f"Evaluated (label available) : {int(eval_mask.sum())}")
-    print(f"Test Accuracy               : {acc:.4f}" if not np.isnan(acc) else "Test Accuracy               : N/A")
-    print(f"Mean Distance Error (same floor only): {avg_mde:.4f} (meters)" if not np.isnan(avg_mde) else "Mean Distance Error (same floor only): N/A")
+    if not np.isnan(acc):
+        print(f"Test Accuracy               : {acc:.4f}")
+    else:
+        print("Test Accuracy               : N/A")
+    if not np.isnan(avg_mde):
+        print(f"Mean Distance Error (same floor only): {avg_mde:.4f} (meters)")
+    else:
+        print("Mean Distance Error (same floor only): N/A")
     print(f"Floor mismatches (excluded from MDE) : {floor_mismatch}")
     print(f"Skipped (rp_id not in rp_map)        : {mde_skipped_notfound}")
 

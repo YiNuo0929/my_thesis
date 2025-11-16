@@ -36,12 +36,12 @@ def load_csvs(path_like: str) -> pd.DataFrame:
         df = pd.read_csv(p, encoding="utf-8-sig")
     return df
 
-def get_feature_cols(df: pd.DataFrame):
+def get_feature_cols(df: pd.DataFrame, col):
     """
     改成固定只抓 ap0 ~ ap255 共 256 維
     """
     all_cols = set(df.columns)
-    ap_cols = [f"ap{i}" for i in range(256)]
+    ap_cols = [f"ap{i}" for i in range(col)]
     missing = [c for c in ap_cols if c not in all_cols]
     if missing:
         raise ValueError(f"資料集中缺少欄位（ap0~ap255）：{missing[:10]} ...")
@@ -224,13 +224,14 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
 
-    parser.add_argument("--hidden", type=int, nargs="+", default=[512, 256, 256])
+    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--dropout", type=float, default=0.4)
     parser.add_argument("--disc_hidden", type=int, default=128)
 
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./rssi_dann_minmax_ckpt")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--column", type=int, default=256)
 
     parser.add_argument("--grl_gamma", type=float, default=10.0)
     parser.add_argument("--domain_loss_w", type=float, default=0.7)
@@ -244,7 +245,8 @@ def main():
     df_tgt = load_csvs(args.target_train_path)
     df_te  = load_csvs(args.test_path)
 
-    ap_cols = get_feature_cols(df_src)
+
+    ap_cols = get_feature_cols(df_src, args.column)
     assert set(ap_cols).issubset(df_tgt.columns), "Target 訓練資料缺少部分 AP 欄位"
     assert set(ap_cols).issubset(df_te.columns),  "Test 資料缺少部分 AP 欄位"
 

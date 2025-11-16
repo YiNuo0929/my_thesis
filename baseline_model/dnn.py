@@ -40,7 +40,7 @@ def get_feature_cols(df: pd.DataFrame):
     改成固定只抓 ap0 ~ ap255 共 256 維
     """
     all_cols = set(df.columns)
-    ap_cols = [f"ap{i}" for i in range(256)]
+    ap_cols = [f"ap{i}" for i in range(168)]
     missing = [c for c in ap_cols if c not in all_cols]
     if missing:
         raise ValueError(f"資料集中缺少欄位（ap0~ap255）：{missing[:10]} ...")
@@ -179,7 +179,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./rssi_dnn_minmax_ckpt")
-    parser.add_argument("--hidden", type=int, nargs="+", default=[512, 256, 128])
+    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--dropout", type=float, default=0.2)
     args = parser.parse_args()
 
