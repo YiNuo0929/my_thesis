@@ -455,7 +455,7 @@ def main():
     parser.add_argument("--dim_feedforward", type=int, default=128)
 
     # 壓縮後 latent 維度 z_dim
-    parser.add_argument("--z_dim", type=int, default=64)
+    parser.add_argument("--z_dim", type=int, default=32)
 
     # reconstruction loss 的權重 λ
     parser.add_argument("--lambda_recon", type=float, default=0.1)

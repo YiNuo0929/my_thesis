@@ -4,8 +4,8 @@ from pathlib import Path
 import pandas as pd
 
 # ==== 路徑設定（可按需修改） ====
-DB_DIR = Path(r"C:\Users\Yinuo\Desktop\UJI_LIB_DB_v2.2\db\06")
-RP_MAP_PATH = Path(r"C:\Users\Yinuo\Desktop\my_thesis\rp_id.csv")
+DB_DIR = Path("UJI_LIB_DB_v2.2/db/10")
+RP_MAP_PATH = Path("rp_id.csv")
 
 TRN_OUT_DIR = DB_DIR / "train_all"   # 訓練資料輸出資料夾
 TST_OUT_DIR = DB_DIR / "test_all"    # 測試資料輸出資料夾

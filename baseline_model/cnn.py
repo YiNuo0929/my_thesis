@@ -33,12 +33,12 @@ def load_csvs(path_like: str) -> pd.DataFrame:
         df = pd.read_csv(p, encoding="utf-8-sig")
     return df
 
-def get_feature_cols(df: pd.DataFrame):
+def get_feature_cols(df: pd.DataFrame, col):
     """
     改成固定只抓 ap0 ~ ap255 共 256 維
     """
     all_cols = set(df.columns)
-    ap_cols = [f"ap{i}" for i in range(256)]
+    ap_cols = [f"ap{i}" for i in range(col)]
     missing = [c for c in ap_cols if c not in all_cols]
     if missing:
         raise ValueError(f"資料集中缺少欄位（ap0~ap255）：{missing[:10]} ...")
@@ -175,6 +175,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./rssi_cnn_minmax_ckpt")
+    parser.add_argument("--column", type=int, default=256)
     args = parser.parse_args()
 
     # os.makedirs(args.out_dir, exist_ok=True)
@@ -182,7 +183,7 @@ def main():
     # --- Load data ---
     df_tr = load_csvs(args.train_path)
     df_te = load_csvs(args.test_path)
-    ap_cols = get_feature_cols(df_tr)
+    ap_cols = get_feature_cols(df_tr, args.column)
     assert set(ap_cols).issubset(df_te.columns), "Test 缺少部分 AP 欄位"
 
     # 類別檢查
