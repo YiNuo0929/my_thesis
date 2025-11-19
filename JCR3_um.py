@@ -265,7 +265,7 @@ class TransformerExtractor(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """
-        x: [B, 1, L] 或 [B, L]（normalized, L=num_tokens）
+        x: [B, 1, L] 或 [B, L]（normalized, L=num_tokens ）
         return: z ∈ [B, z_dim]
         """
         if x.dim() == 3:
