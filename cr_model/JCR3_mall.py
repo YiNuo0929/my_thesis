@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from math import sqrt
 from itertools import cycle
-import random  # NEW
+import random
 
 # ---------- Reproducibility ----------
 def set_seed(seed: int = 42):
@@ -95,6 +95,51 @@ def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val:
     x[miss_mask] = -1.0
     return x
 
+# ---------- Augmentation & Loss Functions (NEW) ----------
+def augment_rssi(x: torch.Tensor, noise_std=0.05, drop_prob=0.1, missing_val=-1.0):
+    """
+    對 Target RSSI 進行增強：
+    1. Jitter: 對非缺失值加上高斯雜訊。
+    2. Masking: 隨機將部分非缺失值設為 missing_val (模擬 AP 消失)。
+    """
+    x_aug = x.clone()
+    valid_mask = (x_aug != missing_val)
+    
+    # 1. Jitter
+    if noise_std > 0:
+        noise = torch.randn_like(x_aug) * noise_std
+        jittered = x_aug + noise
+        jittered = torch.clamp(jittered, 0.0, 1.0)
+        x_aug[valid_mask] = jittered[valid_mask]
+    
+    # 2. Dropout
+    if drop_prob > 0:
+        drop_mask = torch.rand_like(x_aug) < drop_prob
+        final_drop_mask = valid_mask & drop_mask
+        x_aug[final_drop_mask] = missing_val
+    
+    return x_aug
+
+def consistency_loss(logits_aug, logits_clean):
+    """
+    計算兩個 Logits 之間的 KL Divergence。
+    input (aug) 轉為 log_softmax，target (clean) 轉為 softmax
+    """
+    log_probs_aug = F.log_softmax(logits_aug, dim=1)
+    probs_clean = F.softmax(logits_clean, dim=1)
+    return F.kl_div(log_probs_aug, probs_clean, reduction='batchmean')
+
+def calc_entropy_loss(logits):
+    """
+    Conditional Entropy Minimization:
+    H(p) = - sum( p(x) * log p(x) )
+    """
+    p = F.softmax(logits, dim=1)
+    log_p = F.log_softmax(logits, dim=1)
+    entropy = -torch.sum(p * log_p, dim=1)
+    return torch.mean(entropy)
+
+# ---------- Datasets ----------
 class RSSISourceDataset(Dataset):
     """
     Source domain：有 label 的資料（rp_id）
@@ -184,18 +229,8 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :L, :]
         return x
 
-# -------- ViT-style Extractor (2D, side x side, patch-based) + 壓縮 MLP + key_padding_mask --------
+# -------- ViT-style Extractor --------
 class TransformerExtractor(nn.Module):
-    """
-    ViT-style：
-    - input:  [B, 1, L]  (L = num_tokens，會 reshape 成 side x side)
-    - 把 side x side 當單通道影像，切 4x4 patch → 共有 (side/4)^2 個 patch，每個 patch 變一個 token
-    - patch flatten → Linear 投影到 d_model
-    - 加 CLS + 1D 位置編碼
-    - TransformerEncoder
-    - 取 CLS → bottleneck MLP → z_dim
-    - output: z ∈ [B, z_dim]
-    """
     def __init__(
         self,
         num_tokens: int,          # 給 ViT 的 token 數，例如 1024
@@ -207,8 +242,8 @@ class TransformerExtractor(nn.Module):
         use_cls_token: bool,
         mask_value: float,        # 哪個值當作 padding/missing (normalized -1)
         z_dim: int,               # 壓縮後 latent 維度
-        use_mask: bool,
         bottleneck_hidden: int = None,  # 中間 hidden 維度（如果 None 就用 d_model）
+        use_mask: bool = False,
     ):
         super().__init__()
         # ---- 2D reshape 設定 ----
@@ -217,7 +252,7 @@ class TransformerExtractor(nn.Module):
             raise ValueError(f"num_tokens={num_tokens} 不能剛好 reshape 成正方形")
         self.side = side              # e.g. 32 for 1024 tokens
         self.num_tokens = num_tokens
-        self.patch_size = 2           # 固定用 4x4 patch
+        self.patch_size = 8           # 固定用 4x4 patch
         if self.side % self.patch_size != 0:
             raise ValueError(f"side={self.side} 不能被 patch_size={self.patch_size} 整除")
         self.num_patches_per_side = self.side // self.patch_size
@@ -500,7 +535,7 @@ def main():
     parser.add_argument("--column", type=int, default=256)   # 新的 case 記得給 1033
 
     # predictor / recon MLP 的設定（已拆開）
-    parser.add_argument("--pred_hidden", type=int, nargs="+", default=[256, 256],
+    parser.add_argument("--pred_hidden", type=int, nargs="+", default=[512, 256],
                         help="hidden sizes for predictor MLP")
     parser.add_argument("--recon_hidden", type=int, nargs="+", default=[256],
                         help="hidden sizes for reconstruction MLP")
@@ -513,10 +548,18 @@ def main():
     parser.add_argument("--dim_feedforward", type=int, default=128)
 
     # 壓縮後 latent 維度 z_dim
-    parser.add_argument("--z_dim", type=int, default=16)
+    parser.add_argument("--z_dim", type=int, default=64)
 
     # reconstruction loss 的權重 λ
     parser.add_argument("--lambda_recon", type=float, default=0.1)
+
+    # Consistency Loss & Augmentation 參數
+    parser.add_argument("--lambda_consist", type=float, default=0.05, help="weight for consistency loss")
+    parser.add_argument("--noise_std", type=float, default=0.4, help="std for gaussian noise jitter")
+    parser.add_argument("--drop_prob", type=float, default=0.3, help="probability to drop AP signal")
+    
+    # Entropy Minimization 參數
+    parser.add_argument("--lambda_entropy", type=float, default=0.05, help="weight for entropy minimization loss")
 
     # 是否啟用 key_padding_mask
     parser.add_argument("--use_mask", action="store_true", help="啟用 key_padding_mask")
@@ -525,7 +568,7 @@ def main():
                         help="random seed for reproducibility")
 
     # 給 ViT 用的 token 數，這裡固定用 1024
-    parser.add_argument("--vit_tokens", type=int, default=256,
+    parser.add_argument("--vit_tokens", type=int, default=1024,
                         help="token 數（必須能 sqrt 成整數，且 side 能被 patch_size=4 整除）")
 
     args = parser.parse_args()
@@ -606,8 +649,9 @@ def main():
     print(f"z_dim: {model.extractor.z_dim}")
     print(f"d_model: {model.extractor.d_model}")
     print(f"input_dim={model.input_dim}, vit_tokens={model.vit_tokens}")
-    print(f"side={model.extractor.side}, patch_size={model.extractor.patch_size}, num_patches={model.extractor.num_patches}")
     print(f"pred_hidden={args.pred_hidden}, recon_hidden={args.recon_hidden}")
+    print(f"Consistency: λ={args.lambda_consist}, noise={args.noise_std}, drop={args.drop_prob}")
+    print(f"Entropy: λ={args.lambda_entropy}")
     print("---------------------------------------")
 
     # --- Train ---
@@ -617,6 +661,8 @@ def main():
         tr_ce_total = 0.0
         tr_recon_s_total = 0.0
         tr_recon_t_total = 0.0
+        tr_consist_total = 0.0
+        tr_ent_total = 0.0
         tr_acc, n = 0.0, 0
 
         tgt_iter = cycle(dl_tgt)  # target 比較少就循環使用
@@ -633,25 +679,48 @@ def main():
             # 取一個 target batch（不需要 label）
             xb_t = next(tgt_iter)
             xb_t = xb_t.to(device, non_blocking=True)
+            
+            # --- Augmentation (Target) ---
+            with torch.no_grad():
+                xb_t_aug = augment_rssi(xb_t, noise_std=args.noise_std, drop_prob=args.drop_prob, missing_val=-1.0)
+                xb_t_aug = xb_t_aug.to(device, non_blocking=True)
 
             opt.zero_grad()
 
-            # source：有 label，CE + recon
+            # 1. Source Flow: CE + Recon
             logits_s, recon_s = model(xb_s)
             ce_loss = crit(logits_s, yb_s)
 
-            # x_*_norm 一樣是「原始維度」的 normalized RSSI（例如 1033）
             x_s_norm = xb_s.squeeze(1)  # [B, L_in]
-            x_t_norm = xb_t.squeeze(1)  # [B, L_in]
-
             recon_loss_s = reconstruction_loss(recon_s, x_s_norm, mask_value=-1.0)
 
-            # target：只有 recon loss
-            _, recon_t = model(xb_t)
+            # 2. Target Flow (Original): Recon + Entropy + (Target for Consistency)
+            logits_t, recon_t = model(xb_t)
+            x_t_norm = xb_t.squeeze(1)  # [B, L_in]
             recon_loss_t = reconstruction_loss(recon_t, x_t_norm, mask_value=-1.0)
+            
+            # NEW: Entropy Loss (只針對原始 Target)
+            loss_ent = calc_entropy_loss(logits_t)
+
+            # 3. Target Flow (Augmented): Predictor ONLY (for Consistency)
+            # 為了效率，這裡手動執行 TransClassifier 的前半段邏輯，只跑 predictor 分支
+            x_aug_flat = xb_t_aug.squeeze(1)
+            if model.pre_linear is not None:
+                x_vit = model.pre_linear(x_aug_flat)
+            else:
+                x_vit = x_aug_flat
+            x_vit = x_vit.unsqueeze(1)
+            z_aug = model.extractor(x_vit)
+            logits_t_aug = model.predictor(z_aug)
+
+            # 4. Consistency Loss
+            loss_consist = consistency_loss(logits_t_aug, logits_t)
 
             recon_loss_all = recon_loss_s + recon_loss_t
-            total_loss = ce_loss + args.lambda_recon * recon_loss_all
+            total_loss = ce_loss \
+                         + args.lambda_recon * recon_loss_all \
+                         + args.lambda_consist * loss_consist \
+                         + args.lambda_entropy * loss_ent
 
             total_loss.backward()
             opt.step()
@@ -661,6 +730,8 @@ def main():
             tr_ce_total += ce_loss.item() * bs
             tr_recon_s_total += recon_loss_s.item() * bs
             tr_recon_t_total += recon_loss_t.item() * bs
+            tr_consist_total += loss_consist.item() * bs
+            tr_ent_total += loss_ent.item() * bs
             tr_acc += (logits_s.argmax(1) == yb_s).float().sum().item()
             n += bs
 
@@ -669,14 +740,16 @@ def main():
             tr_ce_total /= n
             tr_recon_s_total /= n
             tr_recon_t_total /= n
+            tr_consist_total /= n
+            tr_ent_total /= n
             tr_acc /= n
         else:
             tr_loss_total = tr_ce_total = tr_recon_s_total = tr_recon_t_total = tr_acc = 0.0
 
         print(f"Epoch {epoch:03d} | "
-              f"total {tr_loss_total:.4f} | CE {tr_ce_total:.4f} acc {tr_acc:.4f} | "
-              f"recon_s {tr_recon_s_total:.4f} | recon_t {tr_recon_t_total:.4f} | "
-              f"λ*recon {(args.lambda_recon * (tr_recon_s_total + tr_recon_t_total)):.4f}")
+              f"Tot {tr_loss_total:.3f} | CE {tr_ce_total:.3f} | "
+              f"RecS {tr_recon_s_total:.3f} RecT {tr_recon_t_total:.3f} | "
+              f"Cst {tr_consist_total:.3f} Ent {tr_ent_total:.3f} | Acc {tr_acc:.3f}")
 
     # --- Final Evaluation on Test (一次，只看 predictor 分支) ---
     model.eval()

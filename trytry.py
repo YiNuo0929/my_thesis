@@ -189,7 +189,7 @@ class TransformerExtractor(nn.Module):
     """
     ViT-style：
     - input:  [B, 1, L]  (L = num_tokens，會 reshape 成 side x side)
-    - 把 side x side 當單通道影像，切 4x4 patch → 共有 (side/4)^2 個 patch，每個 patch 變一個 token
+    - 把 side x side 當單通道影像，切 patch → 共有 (side/patch_size)^2 個 patch
     - patch flatten → Linear 投影到 d_model
     - 加 CLS + 1D 位置編碼
     - TransformerEncoder
@@ -207,8 +207,8 @@ class TransformerExtractor(nn.Module):
         use_cls_token: bool,
         mask_value: float,        # 哪個值當作 padding/missing (normalized -1)
         z_dim: int,               # 壓縮後 latent 維度
-        use_mask: bool,
         bottleneck_hidden: int = None,  # 中間 hidden 維度（如果 None 就用 d_model）
+        use_mask: bool = False,
     ):
         super().__init__()
         # ---- 2D reshape 設定 ----
@@ -217,7 +217,7 @@ class TransformerExtractor(nn.Module):
             raise ValueError(f"num_tokens={num_tokens} 不能剛好 reshape 成正方形")
         self.side = side              # e.g. 32 for 1024 tokens
         self.num_tokens = num_tokens
-        self.patch_size = 2           # 固定用 4x4 patch
+        self.patch_size = 2           # patch_size x patch_size
         if self.side % self.patch_size != 0:
             raise ValueError(f"side={self.side} 不能被 patch_size={self.patch_size} 整除")
         self.num_patches_per_side = self.side // self.patch_size
@@ -279,7 +279,7 @@ class TransformerExtractor(nn.Module):
         # ---- 轉成 2D 影像 [B,1,H,W] ----
         img = x.view(B, 1, self.side, self.side)   # [B,1,side,side]
 
-        # ---- 用 unfold 切 4x4 patch ----
+        # ---- 用 unfold 切 patch ----
         # patches_raw: [B, patch_dim, num_patches]
         patches_raw = F.unfold(
             img, kernel_size=self.patch_size, stride=self.patch_size
@@ -369,7 +369,7 @@ class ReconstructionMLP(nn.Module):
         out = self.head(x)   # [B, out_dim]
         return out
 
-# -------- 整體模型 = (Linear 1033→1024) + TransformerExtractor + PredictorMLP + ReconstructionMLP --------
+# -------- 整體模型 = (Linear input_dim→vit_tokens) + TransformerExtractor + PredictorMLP + ReconstructionMLP --------
 class TransClassifier(nn.Module):
     def __init__(
         self,
@@ -434,9 +434,9 @@ class TransClassifier(nn.Module):
         else:
             x_flat = x              # [B, L_in]
 
-        # 若需要，先用 Linear 把 1033 壓成 1024
+        # 若需要，先用 Linear 把 input_dim 壓成 vit_tokens
         if self.pre_linear is not None:
-            x_vit = self.pre_linear(x_flat)  # [B, vit_tokens=1024]
+            x_vit = self.pre_linear(x_flat)  # [B, vit_tokens]
         else:
             x_vit = x_flat                   # [B, L_in]
 
@@ -449,7 +449,7 @@ class TransClassifier(nn.Module):
         # classifier
         logits = self.predictor(z)
 
-        # recon 回原始維度（1033）
+        # recon 回原始維度
         recon = self.reconstructor(z)        # [B, input_dim]
 
         return logits, recon
@@ -482,6 +482,21 @@ def reconstruction_loss(pred, target, mask_value=-1.0):
     diff = diff[mask]
     return torch.mean(diff * diff)
 
+# ---------- LR Scheduler (warmup + cosine) ----------
+def get_lr_factor(epoch: int, warmup_epochs: int, total_epochs: int) -> float:
+    """
+    回傳當前 epoch 對應的 lr 比例因子:
+    - 前 warmup_epochs：線性從 0 -> 1
+    - 之後：cosine decay 從 1 -> 0
+    """
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        return float(epoch + 1) / float(max(1, warmup_epochs))
+    # cosine decay
+    effective_total = max(1, total_epochs - warmup_epochs)
+    t = float(epoch - warmup_epochs) / float(effective_total)
+    t = min(max(t, 0.0), 1.0)
+    return 0.5 * (1.0 + math.cos(math.pi * t))
+
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser()
@@ -494,7 +509,13 @@ def main():
     parser.add_argument("--rp_map_path", type=str, default=r"rp_id.csv")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-3)
+
+    # 分開設定 extractor / head 的 lr
+    parser.add_argument("--lr_extractor", type=float, default=1e-4,
+                        help="extractor & pre_linear 的 learning rate")
+    parser.add_argument("--lr_head", type=float, default=1e-3,
+                        help="predictor/reconstructor 的 learning rate")
+
     parser.add_argument("--missing_val", type=float, default=-110.0)
     parser.add_argument("--out_dir", type=str, default="./rssi_trans_recon_ckpt")
     parser.add_argument("--column", type=int, default=256)   # 新的 case 記得給 1033
@@ -524,9 +545,15 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="random seed for reproducibility")
 
-    # 給 ViT 用的 token 數，這裡固定用 1024
+    # 給 ViT 用的 token 數，這裡預設 256
     parser.add_argument("--vit_tokens", type=int, default=256,
-                        help="token 數（必須能 sqrt 成整數，且 side 能被 patch_size=4 整除）")
+                        help="token 數（必須能 sqrt 成整數，且 side 能被 patch_size 整除）")
+
+    # warmup + cosine scheduler
+    parser.add_argument("--warmup_epochs", type=int, default=5,
+                        help="前幾個 epoch 使用線性 warmup")
+    parser.add_argument("--use_scheduler", action="store_true",
+                        help="啟用 warmup + cosine lr scheduler")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -579,7 +606,7 @@ def main():
     # --- Model / Optim ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_ap = len(ap_cols)           # 例如 1033
-    vit_tokens = args.vit_tokens    # 例如 1024
+    vit_tokens = args.vit_tokens    # 例如 256
 
     model = TransClassifier(
         input_dim=num_ap,
@@ -598,7 +625,30 @@ def main():
         mask_value=-1.0,
     ).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # 把 extractor + pre_linear 視為一組，用 lr_extractor
+    extractor_params = list(model.extractor.parameters())
+    if model.pre_linear is not None:
+        extractor_params += list(model.pre_linear.parameters())
+
+    param_groups = [
+        {
+            "params": extractor_params,
+            "lr": args.lr_extractor,
+            "base_lr": args.lr_extractor
+        },
+        {
+            "params": model.predictor.parameters(),
+            "lr": args.lr_head,
+            "base_lr": args.lr_head
+        },
+        {
+            "params": model.reconstructor.parameters(),
+            "lr": args.lr_head,
+            "base_lr": args.lr_head
+        },
+    ]
+
+    opt = torch.optim.AdamW(param_groups, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
 
     print("---------------------------------------")
@@ -608,10 +658,23 @@ def main():
     print(f"input_dim={model.input_dim}, vit_tokens={model.vit_tokens}")
     print(f"side={model.extractor.side}, patch_size={model.extractor.patch_size}, num_patches={model.extractor.num_patches}")
     print(f"pred_hidden={args.pred_hidden}, recon_hidden={args.recon_hidden}")
+    print(f"lr_extractor={args.lr_extractor}, lr_head={args.lr_head}")
+    print(f"use_scheduler={args.use_scheduler}, warmup_epochs={args.warmup_epochs}")
     print("---------------------------------------")
 
     # --- Train ---
     for epoch in range(1, args.epochs + 1):
+
+        # 更新學習率（warmup + cosine）
+        if args.use_scheduler:
+            lr_factor = get_lr_factor(epoch - 1, args.warmup_epochs, args.epochs)
+            for g in opt.param_groups:
+                if "base_lr" in g:
+                    g["lr"] = g["base_lr"] * lr_factor
+            # 想看的話可以順便印出
+            print(f"[Epoch {epoch:03d}] lr_factor={lr_factor:.4f}, "
+                  f"lr_extractor={opt.param_groups[0]['lr']:.6e}, lr_head={opt.param_groups[1]['lr']:.6e}")
+
         model.train()
         tr_loss_total = 0.0
         tr_ce_total = 0.0
