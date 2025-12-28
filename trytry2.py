@@ -10,19 +10,24 @@ from torch.utils.data import Dataset, DataLoader
 from math import sqrt
 from itertools import cycle
 import random
-import copy
 
 # ---------- Reproducibility ----------
 def set_seed(seed: int = 42):
+    """
+    固定所有常見的隨機種子，讓實驗可重現。
+    """
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    # 讓 cudnn 行為可重現
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# ---------- Utils (保持不變) ----------
+# ---------- Utils ----------
 def load_csvs(path_like: str) -> pd.DataFrame:
     p = Path(path_like)
     if p.is_dir():
@@ -36,6 +41,9 @@ def load_csvs(path_like: str) -> pd.DataFrame:
     return df
 
 def get_feature_cols(df: pd.DataFrame, col):
+    """
+    固定只抓 ap0 ~ ap(col-1) 共 col 維
+    """
     all_cols = set(df.columns)
     ap_cols = [f"ap{i}" for i in range(col)]
     missing = [c for c in ap_cols if c not in all_cols]
@@ -44,6 +52,9 @@ def get_feature_cols(df: pd.DataFrame, col):
     return ap_cols
 
 def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
+    """
+    Min-Max scaler
+    """
     mask_valid = (train_ap != missing_val)
     n_feats = train_ap.shape[1]
     mins = np.zeros(n_feats, dtype=np.float32)
@@ -65,30 +76,43 @@ def fit_scaler(train_ap: np.ndarray, missing_val: float = -110.0):
     return mins, maxs
 
 def apply_scaler(x: np.ndarray, mins: np.ndarray, maxs: np.ndarray, missing_val: float = -110.0):
+    """
+    Min-Max 正規化到 [0,1]，缺失值補 -1
+    """
     x = x.copy().astype(np.float32)
     miss_mask = (x == missing_val)
+
     denom = (maxs - mins)
     denom[denom == 0.0] = 1.0
     x = (x - mins) / denom
     x = np.clip(x, 0.0, 1.0)
+
+    # 缺失的地方直接設成 -1
     x[miss_mask] = -1.0
     return x
 
 class RSSISourceDataset(Dataset):
+    """
+    Source domain：有 label 的資料（rp_id）
+    """
     def __init__(self, df: pd.DataFrame, ap_cols, label_col="rp_id",
                  mins=None, maxs=None, missing_val=-110.0):
         self.ap_cols = ap_cols
-        self.y_raw = df[label_col].values.astype(np.int64)
+        self.y_raw = df[label_col].values.astype(np.int64)  # 保留原始 rp_id（做 MDE 用）
         self.X = df[ap_cols].values.astype(np.float32)
         self.missing_val = missing_val
         self.mins = mins
         self.maxs = maxs
         if (mins is not None) and (maxs is not None):
             self.X = apply_scaler(self.X, self.mins, self.maxs, self.missing_val)
+        # [N, 1, L]
         self.X = np.expand_dims(self.X, axis=1)
+
+        # rp_id -> [0..C-1]
         uniq = np.sort(np.unique(self.y_raw[self.y_raw != -1]))
         self.id2idx = {rid: i for i, rid in enumerate(uniq)}
         self.idx2id = {i: rid for rid, i in self.id2idx.items()}
+        # 不在映射的（例如 -1）設為 -1
         self.y = np.array([self.id2idx.get(int(r), -1) for r in self.y_raw], dtype=np.int64)
 
     def __len__(self):
@@ -98,6 +122,9 @@ class RSSISourceDataset(Dataset):
         return torch.from_numpy(self.X[i]), torch.tensor(self.y[i], dtype=torch.long)
 
 class RSSITargetDataset(Dataset):
+    """
+    Target domain：unlabeled（不使用 rp_id，只做 reconstruction）
+    """
     def __init__(self, df: pd.DataFrame, ap_cols,
                  mins=None, maxs=None, missing_val=-110.0):
         self.ap_cols = ap_cols
@@ -107,6 +134,7 @@ class RSSITargetDataset(Dataset):
         self.maxs = maxs
         if (mins is not None) and (maxs is not None):
             self.X = apply_scaler(self.X, self.mins, self.maxs, self.missing_val)
+        # [N, 1, L]
         self.X = np.expand_dims(self.X, axis=1)
 
     def __len__(self):
@@ -129,6 +157,7 @@ class MLPBlock(nn.Module):
     def forward(self, x):
         return self.seq(x)
 
+# -------- Positional Encoding --------
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
@@ -146,8 +175,9 @@ class PositionalEncoding(nn.Module):
         return x
 
 # =========================================================================
-# NEW: Gated Transformer Encoder Layer
-# 實作論文中的 G1 機制： Y' = Y * sigmoid(X * W_gate)
+# NEW: Gated Transformer Encoder Layer for ViT
+# 這是為了配合論文提出的 Gated Attention 機制 (SDPA Output Gating)
+# 邏輯： Attention Output (Y) 乘上 Sigmoid(Gate Projection(X))
 # =========================================================================
 class GatedTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation=F.relu, batch_first=True):
@@ -155,7 +185,7 @@ class GatedTransformerEncoderLayer(nn.Module):
         # 1. Standard Multi-Head Attention
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
         
-        # 2. Gate Projection (論文核心修改)
+        # 2. Gate Projection (核心修改)
         # 輸入是 hidden state (X)，輸出是與 Attention Output 同維度的 Gate Score
         self.gate_linear = nn.Linear(d_model, d_model)
 
@@ -173,52 +203,69 @@ class GatedTransformerEncoderLayer(nn.Module):
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
         """
-        src: [Batch, Seq_Len, Dim] (因為 batch_first=True)
+        src: [Batch, Num_Patches, Dim] (batch_first=True)
         """
         # --- Part 1: Attention ---
-        # 計算標準 Attention Output (Y)
-        # attn_output: [B, L, D]
+        # attn_output: [B, T, D]
         attn_output, _ = self.self_attn(src, src, src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
         
-        # --- Part 2: Gating (The Modification) ---
+        # --- Part 2: Gating (論文 G1 機制) ---
         # 計算 Gate Score: sigma(X * W)
-        # src 是目前的 hidden state (即 Query 的來源)
+        # src 是目前的 hidden state (Query 來源)
         gate_score = torch.sigmoid(self.gate_linear(src)) 
         
         # 應用 Gate: Y' = Y * Gate
-        # 這裡會依賴輸入 src 來決定是否要保留 attn_output 的特徵
+        # 這裡會依賴輸入 src 來決定是否要保留 attn_output
         gated_output = attn_output * gate_score
         
         # --- Part 3: Residual & Norm ---
-        # 注意：原本是 src + dropout(attn_output)，現在變成 src + dropout(gated_output)
+        # 原本是 src + dropout(attn_output)，現在變成 src + dropout(gated_output)
         src = src + self.dropout1(gated_output)
         src = self.norm1(src)
 
-        # --- Part 4: Feed Forward (保持標準 Transformer 行為) ---
+        # --- Part 4: Feed Forward (保持不變) ---
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
         src = src + self.dropout2(src2)
         src = self.norm2(src)
         
         return src
 
-# -------- Transformer-based Extractor (Updated) --------
+# -------- ViT-style Extractor (2D, side x side, patch-based) --------
 class TransformerExtractor(nn.Module):
+    """
+    ViT-style：
+    - input:  [B, 1, L]  (L = num_tokens，會 reshape 成 side x side)
+    - 支援 Gated Attention (use_gating=True)
+    """
     def __init__(
         self,
-        num_tokens: int,
+        num_tokens: int,          # 給 ViT 的 token 數，例如 1024
         d_model: int,
         nhead: int,
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
         use_cls_token: bool,
-        mask_value: float,
-        z_dim: int,
+        mask_value: float,        # 哪個值當作 padding/missing (normalized -1)
+        z_dim: int,               # 壓縮後 latent 維度
+        use_mask: bool,
         bottleneck_hidden: int = None,
-        use_mask: bool = False,
-        use_gating: bool = True,  # 新增開關
+        use_gating: bool = True,  # 新增：控制是否使用 Gated Attention
     ):
         super().__init__()
+        # ---- 2D reshape 設定 ----
+        side = int(math.sqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"num_tokens={num_tokens} 不能剛好 reshape 成正方形")
+        self.side = side
+        self.num_tokens = num_tokens
+        self.patch_size = 2           # 固定用 4x4 (這裡代碼是 2，對應下面 stride 邏輯)
+        if self.side % self.patch_size != 0:
+            raise ValueError(f"side={self.side} 不能被 patch_size={self.patch_size} 整除")
+        self.num_patches_per_side = self.side // self.patch_size
+        self.num_patches = self.num_patches_per_side ** 2
+        patch_dim = 1 * self.patch_size * self.patch_size  # 單通道，所以 C=1
+
         self.use_cls_token = use_cls_token
         self.d_model = d_model
         self.z_dim = z_dim
@@ -226,20 +273,23 @@ class TransformerExtractor(nn.Module):
         self.mask_value = mask_value
         self.use_gating = use_gating
 
-        self.input_proj = nn.Linear(1, d_model)
+        # patch flatten -> d_model
+        self.patch_proj = nn.Linear(patch_dim, d_model)
 
+        # CLS token（可選）
         if self.use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-            max_len = num_tokens + 1
+            max_len = self.num_patches + 1
         else:
             self.cls_token = None
-            max_len = num_tokens
+            max_len = self.num_patches
 
         self.pos_encoding = PositionalEncoding(d_model, max_len=max_len)
 
-        # --- 替換成 Gated Layer ---
+        # ---- Encoder Layer 選擇 ----
         if self.use_gating:
-            # 使用我們自定義的 Gated Layer
+            # 使用自定義 Gated Layer
+            # 因為 nn.Sequential 對 forward 参数傳遞支援有限，我們用 ModuleList
             layers = [
                 GatedTransformerEncoderLayer(
                     d_model=d_model,
@@ -250,9 +300,9 @@ class TransformerExtractor(nn.Module):
                 )
                 for _ in range(num_layers)
             ]
-            self.encoder = nn.ModuleList(layers) # 用 ModuleList 串接
+            self.encoder = nn.ModuleList(layers)
         else:
-            # 保持原本的 PyTorch Layer
+            # 標準 TransformerEncoder
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=d_model,
                 nhead=nhead,
@@ -262,6 +312,7 @@ class TransformerExtractor(nn.Module):
             )
             self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # ---- bottleneck MLP ----
         if bottleneck_hidden is None:
             bottleneck_hidden = d_model
 
@@ -277,19 +328,37 @@ class TransformerExtractor(nn.Module):
             x = x.squeeze(1)
 
         B, L = x.shape
+        if L != self.num_tokens:
+            raise ValueError(f"輸入長度 L={L} 和 num_tokens={self.num_tokens} 不一致")
+
+        # ---- 轉成 2D 影像 [B,1,H,W] ----
+        img = x.view(B, 1, self.side, self.side)
+
+        # ---- 用 unfold 切 patch ----
+        patches_raw = F.unfold(
+            img, kernel_size=self.patch_size, stride=self.patch_size
+        )
+        patches = patches_raw.transpose(1, 2)
+
+        # ---- 針對 patch 做 mask（如果啟用）----
         key_padding_mask = None
         if self.use_mask:
-            key_padding_mask = (x == self.mask_value)
+            # 如果 patch 內所有值都是 missing_value，則 mask 掉
+            eq_mask = (patches_raw == self.mask_value)
+            key_padding_mask = eq_mask.all(dim=1)
 
-        x = x.unsqueeze(-1)
-        h = self.input_proj(x)
+        # ---- patch embedding ----
+        h = self.patch_proj(patches)
 
+        # ---- 加 CLS token ----
         if self.use_cls_token:
             cls = self.cls_token.expand(B, 1, self.d_model)
             h = torch.cat([cls, h], dim=1)
 
+        # ---- 位置編碼 ----
         h = self.pos_encoding(h)
 
+        # ---- 準備給 encoder 的 key_padding_mask ----
         src_key_padding_mask = None
         if key_padding_mask is not None:
             if self.use_cls_token:
@@ -298,15 +367,16 @@ class TransformerExtractor(nn.Module):
             else:
                 src_key_padding_mask = key_padding_mask
 
-        # --- Encoder Forward ---
+        # ---- Encoder Forward (區分 Gated vs Standard) ----
         if self.use_gating:
-            # 手動串接 Layer
+            # ModuleList 需要手動迴圈
             for layer in self.encoder:
                 h = layer(h, src_key_padding_mask=src_key_padding_mask)
         else:
-            # 標準 TransformerEncoder forward
+            # Standard TransformerEncoder
             h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)
 
+        # ---- 取 CLS 或 mean pooling ----
         if self.use_cls_token:
             cls_feat = h[:, 0, :]
         else:
@@ -350,7 +420,8 @@ class ReconstructionMLP(nn.Module):
 class TransClassifier(nn.Module):
     def __init__(
         self,
-        num_ap: int,
+        input_dim: int,
+        vit_tokens: int,
         n_classes: int,
         d_model: int,
         nhead: int,
@@ -363,11 +434,19 @@ class TransClassifier(nn.Module):
         p_drop: float,
         use_mask: bool,
         mask_value: float,
-        use_gating: bool = True, # 加入參數
+        use_gating: bool = True, # 新增
     ):
         super().__init__()
+        self.input_dim = input_dim
+        self.vit_tokens = vit_tokens
+
+        if input_dim != vit_tokens:
+            self.pre_linear = nn.Linear(input_dim, vit_tokens)
+        else:
+            self.pre_linear = None
+
         self.extractor = TransformerExtractor(
-            num_tokens=num_ap,
+            num_tokens=vit_tokens,
             d_model=d_model,
             nhead=nhead,
             num_layers=num_layers,
@@ -378,7 +457,7 @@ class TransClassifier(nn.Module):
             bottleneck_hidden=None,
             use_mask=use_mask,
             mask_value=mask_value,
-            use_gating=use_gating # 傳遞參數
+            use_gating=use_gating # 傳遞
         )
         self.predictor = PredictorMLP(
             in_dim=z_dim,
@@ -388,15 +467,28 @@ class TransClassifier(nn.Module):
         )
         self.reconstructor = ReconstructionMLP(
             in_dim=z_dim,
-            out_dim=num_ap,
+            out_dim=input_dim,
             hidden=recon_hidden,
             p_drop=p_drop,
         )
 
     def forward(self, x):
-        z = self.extractor(x)
+        if x.dim() == 3:
+            x_flat = x.squeeze(1)
+        else:
+            x_flat = x
+
+        if self.pre_linear is not None:
+            x_vit = self.pre_linear(x_flat)
+        else:
+            x_vit = x_flat
+
+        x_vit = x_vit.unsqueeze(1)
+        z = self.extractor(x_vit)
+
         logits = self.predictor(z)
         recon = self.reconstructor(z)
+
         return logits, recon
 
 # ---------- Metrics / Maps / Loss (保持不變) ----------
@@ -421,7 +513,7 @@ def reconstruction_loss(pred, target, mask_value=-1.0):
     diff = diff[mask]
     return torch.mean(diff * diff)
 
-# ---------- Main (Updated Arguments) ----------
+# ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source_train_path", type=str, required=True)
@@ -443,19 +535,21 @@ def main():
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dim_feedforward", type=int, default=128)
-    parser.add_argument("--z_dim", type=int, default=32)
+    parser.add_argument("--z_dim", type=int, default=16)
 
     parser.add_argument("--lambda_recon", type=float, default=0.1)
 
-    parser.add_argument("--use_mask", action="store_true", help="啟用 key_padding_mask (處理缺值)")
-    parser.add_argument("--no_gating", action="store_true", help="如果加上這個 flag，就關閉 Gating 機制 (回到標準 Transformer)")
+    parser.add_argument("--use_mask", action="store_true", help="啟用 key_padding_mask")
+    # 預設使用 Gating，加 flag 則關閉
+    parser.add_argument("--no_gating", action="store_true", help="關閉 Gated Attention")
     
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--vit_tokens", type=int, default=256)
 
     args = parser.parse_args()
     set_seed(args.seed)
 
-    # --- Load data (保持不變) ---
+    # --- Load data ---
     df_src = load_csvs(args.source_train_path)
     df_tgt = load_csvs(args.target_train_path)
     df_te  = load_csvs(args.test_path)
@@ -488,14 +582,16 @@ def main():
     ds_te = TestDataset()
     dl_te = DataLoader(ds_te, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
-    # --- Model / Optim ---
+    # --- Model ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_ap = len(ap_cols)
-
-    use_gating = not args.no_gating  # 預設開啟
+    vit_tokens = args.vit_tokens
+    
+    use_gating = not args.no_gating
 
     model = TransClassifier(
-        num_ap=num_ap,
+        input_dim=num_ap,
+        vit_tokens=vit_tokens,
         n_classes=len(id2idx),
         d_model=args.d_model,
         nhead=args.nhead,
@@ -508,18 +604,20 @@ def main():
         p_drop=args.dropout,
         use_mask=args.use_mask,
         mask_value=-1.0,
-        use_gating=use_gating  # 傳遞設定
+        use_gating=use_gating # 傳入
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
 
     print("---------------------------------------")
-    print(f"use mask (for missing data): {model.extractor.use_mask}")
-    print(f"use gating (for noise filter): {model.extractor.use_gating}") # 顯示狀態
+    print(f"ViT-style Model Configured")
+    print(f"use mask: {model.extractor.use_mask}")
+    print(f"use gating: {model.extractor.use_gating}")
     print(f"z_dim: {model.extractor.z_dim}")
     print(f"d_model: {model.extractor.d_model}")
-    print(f"num_ap={num_ap}")
+    print(f"input_dim={model.input_dim}, vit_tokens={model.vit_tokens}")
+    print(f"side={model.extractor.side}, patch_size={model.extractor.patch_size}, num_patches={model.extractor.num_patches}")
     print("---------------------------------------")
 
     # --- Train (保持不變) ---
@@ -541,7 +639,6 @@ def main():
 
             xb_s = xb_s.to(device, non_blocking=True)
             yb_s = yb_s.to(device, non_blocking=True)
-
             xb_t = next(tgt_iter)
             xb_t = xb_t.to(device, non_blocking=True)
 
@@ -554,7 +651,6 @@ def main():
             x_t_norm = xb_t.squeeze(1)
 
             recon_loss_s = reconstruction_loss(recon_s, x_s_norm, mask_value=-1.0)
-
             _, recon_t = model(xb_t)
             recon_loss_t = reconstruction_loss(recon_t, x_t_norm, mask_value=-1.0)
 
@@ -585,7 +681,7 @@ def main():
               f"total {tr_loss_total:.4f} | CE {tr_ce_total:.4f} acc {tr_acc:.4f} | "
               f"recon_s {tr_recon_s_total:.4f} | recon_t {tr_recon_t_total:.4f}")
 
-    # --- Final Evaluation (保持不變) ---
+    # --- Eval (保持不變) ---
     model.eval()
     preds_idx, gts_idx, gts_rpid = [], [], []
     with torch.no_grad():
@@ -635,7 +731,7 @@ def main():
     print("==== Final Test Metrics ====")
     print(f"Test samples total          : {len(gts_idx)}")
     print(f"Test Accuracy               : {acc:.4f}")
-    print(f"Mean Distance Error (same floor): {avg_mde:.4f}")
+    print(f"Mean Distance Error         : {avg_mde:.4f}")
     print(f"Floor mismatches             : {floor_mismatch}")
     print(f"Skipped                      : {mde_skipped_notfound}")
 
