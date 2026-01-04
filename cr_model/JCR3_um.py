@@ -531,7 +531,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--missing_val", type=float, default=-110.0)
-    parser.add_argument("--out_dir", type=str, default="./rssi_trans_recon_ckpt")
+    parser.add_argument("--out_dir", type=str, default="./3head_mall_result")
     parser.add_argument("--column", type=int, default=256)   # 新的 case 記得給 1033
 
     # predictor / recon MLP 的設定（已拆開）
