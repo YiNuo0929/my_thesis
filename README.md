@@ -74,12 +74,6 @@ Mall Dataset 因資料量較大，因此**未上傳至 GitHub**。
 
 ---
 
-## Train / Test Split
-
-所有 Source、Target 與 Test 的資料切分皆由小程式自動產生，因此不需要手動切分資料。
-
----
-
 ## Unused Dataset
 
 Repository 中仍保留
@@ -203,6 +197,6 @@ python 3head/JCR3_simulation.py \
 
 # Notes
 
-- 本 Repository 保留了研究過程中的大部分程式，因此包含許多測試版本、Prototype 與消融實驗。
+- 本 Repository 保留了研究過程中的大部分程式，因此包含許多測試版本、Prototype 、消融實驗或資料處理和實驗呈現的程式碼。
 - 若僅需重現論文結果，建議直接使用 **`3head/`** 中的程式即可。
 - 其他模型及實驗設計的詳細內容皆可參考論文說明。
