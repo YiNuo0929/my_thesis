@@ -869,7 +869,21 @@ def run_z_attribution(
     curves = {"ens": ens_ig_mean_abs}
     for hi in range(H):
         curves[f"head{hi}"] = head_ig_mean_abs[hi]
+    # 原本 overlay 圖：可以保留，但建議只放 appendix
+
     plot_ig_mean_abs_overlay(out_dir, curves)
+    # Thesis 主文建議放這張：三個 heads 對 bottleneck dimensions 的 attribution heatmap
+
+    head_only_curves = {
+        f"head{hi}": head_ig_mean_abs[hi]
+        for hi in range(H)
+    }
+
+    plot_head_attribution_heatmap(
+        out_dir=out_dir,
+        head_curves_dict=head_only_curves,
+        topk=topk
+    )
 
     print("[ATTR] Done. Output dir =", out_dir)
 
@@ -890,6 +904,146 @@ def plot_ig_mean_abs_overlay(out_dir, curves_dict):
     plt.savefig(fp, dpi=200, bbox_inches="tight")
     plt.close()
     print("[ATTR saved]", fp)
+
+def plot_head_attribution_heatmap(out_dir, head_curves_dict, topk=20):
+    """
+    Thesis-ready multi-head attribution heatmap
+
+    head_curves_dict:
+      {
+        "head0": mean_abs_attr [D],
+        "head1": mean_abs_attr [D],
+        "head2": mean_abs_attr [D],
+      }
+
+    圖的概念：
+    - x-axis: union of top-k latent dims from all heads
+    - y-axis: predictor heads
+    - color: normalized attribution strength
+    """
+
+    _ensure_dir(out_dir)
+
+    head_names = list(head_curves_dict.keys())
+    curves = [head_curves_dict[h] for h in head_names]
+
+    # =========================
+    # Step 1: 取各 head top-k union
+    # =========================
+    union_dims = set()
+    for c in curves:
+        top_idx = np.argsort(-c)[:topk]
+        union_dims.update(top_idx.tolist())
+
+    union_dims = list(union_dims)
+
+    # =========================
+    # Step 2: 用 mean importance 排序（回到原本版本）
+    # shared + complementary 比較自然
+    # =========================
+    mean_importance = np.mean(
+        np.stack([c[union_dims] for c in curves], axis=0),
+        axis=0
+    )
+
+    sorted_order = np.argsort(-mean_importance)
+    union_dims = [union_dims[i] for i in sorted_order]
+
+    # =========================
+    # Step 3: 建立 heatmap matrix
+    # [num_heads, num_union_dims]
+    # =========================
+    mat = np.stack(
+        [c[union_dims] for c in curves],
+        axis=0
+    )
+
+    # =========================
+    # Step 4: row-wise normalization
+    # 每個 head 比自己內部相對重要性
+    # =========================
+    mat_norm = mat / (mat.max(axis=1, keepdims=True) + 1e-12)
+
+    # =========================
+    # Step 5: plot
+    # =========================
+    plt.figure(
+        figsize=(max(8, len(union_dims) * 0.35), 2.8)
+    )
+
+    im = plt.imshow(
+        mat_norm,
+        aspect="auto",
+        cmap="viridis",
+        vmin=0,
+        vmax=1
+    )
+
+    plt.yticks(
+        np.arange(len(head_names)),
+        head_names
+    )
+
+    plt.xticks(
+        np.arange(len(union_dims)),
+        [str(d) for d in union_dims],
+        rotation=45
+    )
+
+    plt.xlabel("Bottleneck latent dimensions")
+    plt.ylabel("Predictor heads")
+
+    cbar = plt.colorbar(im)
+    cbar.set_label("normalized attribution strength")
+
+    fp = os.path.join(
+        out_dir,
+        f"multihead_top{topk}_attribution_heatmap.png"
+    )
+
+    plt.savefig(
+        fp,
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    print("[ATTR saved]", fp)
+
+    # =========================
+    # Extra: overlap analysis
+    # =========================
+    print("==== Top-k overlap analysis ====")
+
+    top_sets = {}
+    for h, c in head_curves_dict.items():
+        top_sets[h] = set(
+            np.argsort(-c)[:topk].tolist()
+        )
+
+    for i in range(len(head_names)):
+        for j in range(i + 1, len(head_names)):
+            hi = head_names[i]
+            hj = head_names[j]
+
+            inter = len(
+                top_sets[hi] & top_sets[hj]
+            )
+
+            union = len(
+                top_sets[hi] | top_sets[hj]
+            )
+
+            jaccard = (
+                inter / union
+                if union > 0 else 0.0
+            )
+
+            print(
+                f"{hi} vs {hj}: "
+                f"overlap={inter}/{topk}, "
+                f"Jaccard={jaccard:.3f}"
+            )
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser()
@@ -937,10 +1091,14 @@ def main():
                         help="熱點圖/柱狀圖顯示 top-k 維度")
     parser.add_argument("--attr_ig_steps", type=int, default=50,
                         help="Integrated Gradients steps（越大越穩但越慢）")
+    
+    parser.add_argument("--model_dir", type=str, default="./models", help="儲存訓練完成模型的資料夾")
+    parser.add_argument("--model_name", type=str, default="TransJCR.pth", help="模型檔名")
 
     args = parser.parse_args()
     set_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.model_dir, exist_ok=True)
 
     # --- Load data ---
     df_src = load_csvs(args.source_train_path)
@@ -1111,6 +1269,19 @@ def main():
               f"RecS {tr_recon_s_total:.3f} RecT {tr_recon_t_total:.3f} | "
               f"Cst {tr_consist_total:.3f} Ent {tr_ent_total:.3f} | Acc(ens) {tr_acc:.3f}")
 
+    # --- Save trained model ---
+    model_save_path = os.path.join(args.model_dir, args.model_name)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "id2idx": id2idx,
+        "idx2id": idx2id,
+        "ap_cols": ap_cols,
+        "mins": mins,
+        "maxs": maxs,
+        "args": vars(args),
+    }, model_save_path)
+
+    print(f"==== Model saved to: {model_save_path} ====")
     # --- Final Evaluation on Test (ensemble) + collect probs for visualization ---
     model.eval()
     preds_idx, gts_idx, gts_rpid = [], [], []

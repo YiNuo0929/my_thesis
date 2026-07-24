@@ -260,8 +260,12 @@ def main():
     parser.add_argument("--lambda_u", type=float, default=1.0)
     parser.add_argument("--lambda_r", type=float, default=4.0)
 
+    parser.add_argument("--model_dir", type=str, default="./models", help="儲存訓練完成模型的資料夾")
+    parser.add_argument("--model_name", type=str, default="fidora.pth", help="模型檔名")
+
     args = parser.parse_args()
     set_seed(args.seed)
+    os.makedirs(args.model_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     df_src = load_csvs(args.source_train_path)
@@ -331,6 +335,20 @@ def main():
         print(f"Epoch {epoch:03d} | cls_loss (LA): {running_cls/steps_per_epoch:.3f} | "
               f"clu_loss (LU): {running_clu/steps_per_epoch:.3f} | rec_loss (LR): {running_rec/steps_per_epoch:.3f} | "
               f"src_acc: {running_acc/steps_per_epoch:.4f}")
+
+    # ---------- Save trained model ----------
+    model_save_path = os.path.join(args.model_dir, args.model_name)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "ap_cols": ap_cols,
+        "id2idx": id2idx,
+        "idx2id": idx2id,
+        "in_dim": in_dim,
+        "n_classes": n_classes,
+        "args": vars(args),
+    }, model_save_path)
+
+    print(f"[*] Model saved to: {model_save_path}")
 
     model.eval()
     preds_idx, gts_idx, gts_rpid = [], [], []

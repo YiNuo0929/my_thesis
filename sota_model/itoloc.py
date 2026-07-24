@@ -256,8 +256,12 @@ def main():
     parser.add_argument("--lambda_d", type=float, default=0.4)
     parser.add_argument("--gamma_s", type=float, default=0.2)
 
+    parser.add_argument("--model_dir", type=str, default="./models", help="儲存訓練完成模型的資料夾")
+    parser.add_argument("--model_name", type=str, default="itoloc.pth", help="模型檔名")
+
     args = parser.parse_args()
     set_seed(args.seed)
+    os.makedirs(args.model_dir, exist_ok=True)
 
     # --------- Load DataFrames ---------
     df_src = load_csvs(args.source_train_path)
@@ -352,6 +356,19 @@ def main():
         print(f"Epoch {epoch:03d} | cls_loss: {running_cls/steps_per_epoch:.3f} | "
               f"spa_loss: {running_spa/steps_per_epoch:.3f} | dom_loss: {running_dom/steps_per_epoch:.3f} | "
               f"src_acc: {running_acc/steps_per_epoch:.4f}")
+
+    # --------- Save trained model ---------
+    model_save_path = os.path.join(args.model_dir, args.model_name)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "ap_cols": ap_cols,
+        "id2idx": id2idx,
+        "idx2id": idx2id,
+        "n_classes": n_classes,
+        "args": vars(args),
+    }, model_save_path)
+
+    print(f"[*] Model saved to: {model_save_path}")
 
     # --------- Evaluation ---------
     model.eval()

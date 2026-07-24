@@ -236,9 +236,13 @@ def main():
     parser.add_argument("--grl_gamma", type=float, default=10.0)
     parser.add_argument("--domain_loss_w", type=float, default=0.7)
 
+    parser.add_argument("--model_dir", type=str, default="./models", help="儲存訓練完成模型的資料夾")
+    parser.add_argument("--model_name", type=str, default="dann.pth", help="模型檔名")
+
     args = parser.parse_args()
     # os.makedirs(args.out_dir, exist_ok=True)
     set_seed(args.seed)
+    os.makedirs(args.model_dir, exist_ok=True)
 
     # --------- Load DataFrames ---------
     df_src = load_csvs(args.source_train_path)
@@ -367,6 +371,21 @@ def main():
               f"| src_acc {avg_src_acc:.4f} "
               f"| lambda {grl_lambda:.3f}")
 
+    # --------- Save trained model ---------
+    model_save_path = os.path.join(args.model_dir, args.model_name)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "ap_cols": ap_cols,
+        "id2idx": id2idx,
+        "idx2id": idx2id,
+        "mins": mins,
+        "maxs": maxs,
+        "n_classes": n_classes,
+        "args": vars(args),
+    }, model_save_path)
+
+    print(f"[*] Model saved to: {model_save_path}")
+    
     # --------- Evaluate on Test ---------
     model.eval()
     preds_idx, gts_idx, gts_rpid = [], [], []
