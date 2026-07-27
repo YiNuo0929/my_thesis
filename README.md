@@ -90,13 +90,13 @@ UJI_LIB_DB_v2.2
 
 Repository 中包含許多不同版本的模型，主要是研究過程中的發想、Prototype、Baseline 與消融實驗，因此資料夾數量較多。
 
-## baseline_model/ & cr_model/
+## baseline_model/ & cr_model/ & 零散的model
 
 存放各種 Baseline Model。
 
 存放研究過程中的模型演進、Prototype、消融實驗以及其他測試程式。
 
-若有興趣了解整個研究發展過程，可自行參考此資料夾(但很雜我認為沒必要)。
+若有興趣了解整個研究發展過程，可自行參考此資料夾(但很雜我認為沒必要)，commit也有寫。
 
 ---
 
